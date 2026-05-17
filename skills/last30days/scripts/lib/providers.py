@@ -19,7 +19,11 @@ OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
 CODEX_RESPONSES_URL = "https://chatgpt.com/backend-api/codex/responses"
 XAI_RESPONSES_URL = "https://api.x.ai/v1/responses"
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-OPENROUTER_DEFAULT = "google/gemini-flash-2.0"
+# OpenRouter routes the Gemini Flash Lite tier as the -preview slug; that is the
+# stable form on that routing layer even though native Gemini's GEMINI_FLASH_LITE
+# constant is suffix-free. If GEMINI_FLASH_LITE moves to a non-preview stable ID,
+# double-check that OpenRouter's slug still maps to the same upstream model.
+OPENROUTER_DEFAULT = "google/gemini-3.1-flash-lite-preview"
 
 
 class ReasoningClient:
