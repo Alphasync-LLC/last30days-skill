@@ -1,13 +1,18 @@
 # last30days Skill
 
-Claude Code skill for researching any topic across Reddit, X, YouTube, and web.
-Python scripts with multi-source search aggregation.
+Agent Skills package for researching any topic across Reddit, X, YouTube, and web. Installable across Claude Code (most common host), Codex, Cursor, GitHub Copilot, Gemini CLI, and 50+ other [Agent Skills](https://agentskills.io) hosts. Python scripts with multi-source search aggregation.
 
 ## Structure
 - `skills/last30days/SKILL.md` — canonical skill definition
 - `skills/last30days/scripts/last30days.py` — main research engine
 - `skills/last30days/scripts/lib/` — search, enrichment, rendering modules
 - `skills/last30days/scripts/lib/vendor/bird-search/` — vendored X search client
+
+## Orientation
+- This is an Agent Skills package, not a CLI tool. The product is the slash-command-invoked skill (`/last30days <topic>` in most harnesses); `scripts/last30days.py` is implementation. Claude Code is the most common host but not the only one — features must work across every harness the skill installs into.
+- Feature design starts from the slash-command UX. A new engine flag with no SKILL.md integration is incomplete — the model invoking the skill won't know the flag exists.
+- README and PR examples show `/last30days <topic>` first. Direct CLI invocation (`python3 scripts/last30days.py ...`) is a fallback for scripting, cron, and dev-time engine testing; label it as such, never as the primary path.
+- Slash commands don't pass shell mechanics through. `/last30days OpenClaw --emit=html | pbcopy` is invalid in any harness — either use the slash form (no flags or pipes; let the model translate user intent into engine flags) or use the direct CLI form (full `python3 ...` with explicit flags and a real shell).
 
 ## Commands
 ```bash
