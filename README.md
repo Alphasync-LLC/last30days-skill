@@ -170,6 +170,7 @@ Say "eli5 on" after any research run. The synthesis rewrites in plain language. 
 | **Claude Code** (recommended) | `/plugin marketplace add mvanhorn/last30days-skill` | Auto via marketplace, or `claude plugin update last30days@last30days-skill` |
 | **Codex, Cursor, Copilot, Gemini CLI, GitHub Copilot, or any of 50+ [Agent Skills](https://agentskills.io) hosts** | `npx skills add mvanhorn/last30days-skill -g` | `npx skills update last30days -g` |
 | **claude.ai** (web) | [Download `last30days.skill`](https://github.com/mvanhorn/last30days-skill/releases/latest/download/last30days.skill) and upload via Settings > Capabilities > Skills > + | Re-download and re-upload |
+| **Claude Desktop** | [Download the `.mcpb` for your platform](https://github.com/mvanhorn/last30days-skill/releases/latest) and drag into Settings > Extensions | Re-download and drag the new bundle in |
 | **OpenClaw** | `clawhub install last30days-official` | `clawhub update last30days-official` |
 
 ### Claude Code (recommended)
@@ -228,6 +229,24 @@ List and remove with `npx skills list -g` and `npx skills remove last30days -g`.
 3. Click the `+` button in the Skills panel and drop the file in
 
 Enable "Code execution and file creation" under Capabilities first — skills won't run without it.
+
+### Claude Desktop
+
+Claude Desktop installs `/last30days` as an MCP server via a `.mcpb` bundle (a one-click Model Context Protocol package).
+
+1. Go to the [latest release](https://github.com/mvanhorn/last30days-skill/releases/latest) and download the `.mcpb` for your platform:
+   - macOS Apple Silicon: `last30days-pp-mcp-darwin-arm64.mcpb`
+   - macOS Intel: `last30days-pp-mcp-darwin-amd64.mcpb`
+   - Linux x86_64: `last30days-pp-mcp-linux-amd64.mcpb`
+2. Open Claude Desktop, go to Settings > Extensions, and drag the file in.
+3. When prompted, paste API keys for the sources you want to enable. Every field is optional — the engine degrades to web-only mode if you skip them all. Keys are stored in your OS keychain.
+4. Restart Claude Desktop. Ask Claude to "research Peter Steinberger" or any topic and it will call the `research` tool.
+
+**Host requirement:** Python 3.12+ on PATH. The bundle ships the engine source but uses your local Python interpreter. Install from [python.org](https://www.python.org/downloads/) on Windows; macOS and most Linux distros ship a compatible version.
+
+**Keys don't sync with the Code skill.** Claude Desktop and Claude Code maintain separate credential stores by design. If you already configured `~/.config/last30days/.env` for the Code skill, you'll re-enter the same keys here once.
+
+Windows support is deferred until per-platform manifest entry points are sorted out; track in a follow-up issue.
 
 ### OpenClaw
 
