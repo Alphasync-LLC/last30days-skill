@@ -154,15 +154,25 @@ func TestUserConfigShape(t *testing.T) {
 	}
 }
 
-func TestPlatformsCoverDesktopTargets(t *testing.T) {
+func TestPlatformsMatchShippingMatrix(t *testing.T) {
+	// compatibility.platforms must list exactly what the release CI
+	// actually packages. Listing a platform we don't ship would let
+	// Claude Desktop start an install that has no matching binary inside
+	// the bundle, producing a silent failure. The CI matrix in
+	// .github/workflows/release.yml currently covers darwin (arm64 +
+	// amd64) and linux/amd64; Windows is deferred.
 	m := loadManifest(t)
-	want := map[string]bool{"darwin": false, "linux": false, "win32": false}
+	required := map[string]bool{"darwin": false, "linux": false}
+	forbidden := map[string]bool{"win32": true}
 	for _, p := range m.Compatibility.Platforms {
-		if _, expected := want[p]; expected {
-			want[p] = true
+		if _, ok := required[p]; ok {
+			required[p] = true
+		}
+		if forbidden[p] {
+			t.Errorf("compatibility.platforms contains %q but the release matrix does not ship that platform; add it to the matrix or remove from the manifest", p)
 		}
 	}
-	for p, found := range want {
+	for p, found := range required {
 		if !found {
 			t.Errorf("compatibility.platforms missing %q", p)
 		}

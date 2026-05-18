@@ -145,8 +145,7 @@
     "claude_desktop": ">=1.0.0",
     "platforms": [
       "darwin",
-      "linux",
-      "win32"
+      "linux"
     ]
   }
 }

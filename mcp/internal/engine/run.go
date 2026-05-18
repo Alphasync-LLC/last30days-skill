@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"time"
 )
 
@@ -140,12 +141,23 @@ func resolveTimeout(explicit time.Duration) time.Duration {
 	return DefaultTimeout
 }
 
-// buildEnv stitches PYTHONPATH onto os.Environ + ExtraEnv. The engine's
-// `from lib import ...` statements resolve because lib/ sits next to
-// last30days.py inside CacheDir.
+// buildEnv stitches PYTHONPATH onto os.Environ + ExtraEnv. Any pre-existing
+// PYTHONPATH in the parent environment is dropped before appending the
+// cache dir; otherwise the child sees two PYTHONPATH= entries and POSIX
+// getenv returns the first one, so the user's value wins and the engine's
+// `from lib import ...` fails with ModuleNotFoundError. The engine is
+// self-contained and does not need the user's Python module search path.
 func buildEnv(cacheDir string, extra []string) []string {
-	base := os.Environ()
-	base = append(base, "PYTHONPATH="+cacheDir)
+	const pyKey = "PYTHONPATH="
+	parent := os.Environ()
+	base := make([]string, 0, len(parent)+1+len(extra))
+	for _, kv := range parent {
+		if strings.HasPrefix(kv, pyKey) {
+			continue
+		}
+		base = append(base, kv)
+	}
+	base = append(base, pyKey+cacheDir)
 	base = append(base, extra...)
 	return base
 }

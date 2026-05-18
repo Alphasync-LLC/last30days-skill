@@ -117,6 +117,64 @@ func TestRunSetsPythonPath(t *testing.T) {
 	}
 }
 
+// TestRunDropsPreExistingPythonPath guards the buildEnv dedup: when the
+// parent already sets PYTHONPATH (common on dev machines and CI runners
+// that touch Python), the child must NOT see two PYTHONPATH= entries.
+// POSIX getenv returns the first match, so a duplicate from os.Environ
+// would shadow our cache-dir entry and break `from lib import ...`.
+func TestRunDropsPreExistingPythonPath(t *testing.T) {
+	stub := makeStubPython(t)
+	cache := stageCache(t)
+	t.Setenv("PYTHONPATH", "/users-stale-pythonpath")
+	t.Setenv("STUB_ECHO_ENV", "PYTHONPATH")
+
+	res, err := Run(context.Background(), RunOptions{
+		PythonPath: stub,
+		CacheDir:   cache,
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	got := strings.TrimSpace(string(res.Stdout))
+	want := "PYTHONPATH=" + cache
+	if got != want {
+		t.Fatalf("stdout = %q, want %q (stale parent value leaked through)", got, want)
+	}
+}
+
+func TestBuildEnvDropsAllPreExistingPythonPath(t *testing.T) {
+	// Direct unit test on buildEnv to catch the case where the parent has
+	// PYTHONPATH set: the returned slice must contain exactly one
+	// PYTHONPATH= entry, and it must be ours.
+	t.Setenv("PYTHONPATH", "/parent/one")
+	cache := "/cache/dir"
+	out := buildEnv(cache, []string{"EXTRA=1"})
+
+	var pythonPaths []string
+	for _, kv := range out {
+		if strings.HasPrefix(kv, "PYTHONPATH=") {
+			pythonPaths = append(pythonPaths, kv)
+		}
+	}
+	if len(pythonPaths) != 1 {
+		t.Fatalf("got %d PYTHONPATH entries, want 1: %v", len(pythonPaths), pythonPaths)
+	}
+	if pythonPaths[0] != "PYTHONPATH="+cache {
+		t.Fatalf("PYTHONPATH = %q, want %q", pythonPaths[0], "PYTHONPATH="+cache)
+	}
+	// Confirm ExtraEnv still rides along.
+	found := false
+	for _, kv := range out {
+		if kv == "EXTRA=1" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatal("EXTRA=1 missing from buildEnv output")
+	}
+}
+
 func TestRunSurfacesExitCode(t *testing.T) {
 	stub := makeStubPython(t)
 	cache := stageCache(t)
