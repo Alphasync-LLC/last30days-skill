@@ -1026,7 +1026,7 @@ def render_brief(report: schema.Report, cluster_limit: int = 8) -> str:
             )
         lines.append("")
 
-    tensions = [c for c in report.clusters if c.uncertainty]
+    tensions = [c for c in report.clusters[:cluster_limit] if c.uncertainty]
     if tensions:
         lines.append("## Topic Tensions")
         lines.append("")
@@ -1069,7 +1069,7 @@ def _extract_audience_questions(candidates: list[schema.Candidate]) -> list[str]
         if not title:
             continue
         first_word = title.split()[0].lower().rstrip("?")
-        if title.endswith("?") or first_word in _QUESTION_WORDS:
+        if title.endswith("?"):
             norm = title.lower()
             if norm not in seen:
                 seen.add(norm)
@@ -1712,8 +1712,6 @@ def _stats_actor(item: schema.SourceItem) -> str | None:
         return f"r/{item.container}"
     if item.source in {"x", "bluesky", "truthsocial"} and item.author:
         return f"@{item.author.lstrip('@')}"
-    if item.source == "grounding" and item.container:
-        return item.container
     if item.source == "youtube" and item.author:
         return item.author
     if item.container and item.container != "Polymarket":

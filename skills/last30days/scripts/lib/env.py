@@ -272,9 +272,13 @@ def get_config() -> dict[str, Any]:
 
     sc_key_raw = config.get('SCRAPECREATORS_API_KEY') or ''
     if ',' in sc_key_raw:
-        import random
         sc_keys = [k.strip() for k in sc_key_raw.split(',') if k.strip()]
-        config['SCRAPECREATORS_API_KEY'] = random.choice(sc_keys) if sc_keys else ''
+        if sc_keys:
+            import hashlib
+            idx = int(hashlib.md5(','.join(sc_keys).encode()).hexdigest(), 16) % len(sc_keys)
+            config['SCRAPECREATORS_API_KEY'] = sc_keys[idx]
+        else:
+            config['SCRAPECREATORS_API_KEY'] = ''
 
     # Track which config source was used
     if project_env_path:

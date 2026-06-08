@@ -313,7 +313,7 @@ class TestSearchRedditPublicHighLevel:
         reddit_public.search("test")
 
         req = mock_urlopen.call_args[0][0]
-        assert "Mozilla/5.0" in req.get_header("User-agent")
+        assert "last30days/3.0" in req.get_header("User-agent")
 
 
 class TestMissingSubreddit:

@@ -22,11 +22,7 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeou
 from typing import Any, Dict, List, Optional
 
 
-USER_AGENT = (
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/124.0.0.0 Safari/537.36"
-)
+USER_AGENT = "last30days/3.0 (research tool)"
 
 # Depth-aware limits for thread counts
 DEPTH_LIMITS = {
@@ -65,9 +61,7 @@ def _fetch_json(url: str, timeout: int = 15) -> Optional[Dict[str, Any]]:
     headers = {
         "User-Agent": USER_AGENT,
         "Accept": "application/json",
-        "Accept-Language": "en-US,en;q=0.9",
         "Accept-Encoding": "gzip, deflate",
-        "Connection": "keep-alive",
     }
     req = urllib.request.Request(url, headers=headers)
 
