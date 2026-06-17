@@ -4,6 +4,7 @@ import json
 import re
 import socket
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -268,6 +269,54 @@ def get_text(
     except HTTPError as e:
         log(f"get_text failed ({e}): {url}")
         return None
+
+
+class RateLimiter:
+    """Thread-safe minimum-interval throttle for an endpoint family.
+
+    The keyless source tiers run under the pipeline's ThreadPoolExecutor, so a
+    multi-subquery run can fire many requests at the same host at once. A bare
+    per-request retry budget does not prevent that stampede — it only reacts
+    after a 429. This spaces calls so concurrent futures sharing one limiter
+    cannot burst past ``min_interval`` seconds between requests.
+    """
+
+    def __init__(self, min_interval: float):
+        self.min_interval = min_interval
+        self._last = 0.0
+        self._lock = threading.Lock()
+
+    def acquire(self) -> None:
+        """Block until at least ``min_interval`` has elapsed since the last call."""
+        with self._lock:
+            now = time.monotonic()
+            wait = self.min_interval - (now - self._last)
+            if wait > 0:
+                time.sleep(wait)
+                now = time.monotonic()
+            self._last = now
+
+
+# Shared across all keyless Reddit tiers (RSS, listing, shreddit) so their
+# combined fan-out is throttled as one family, not three independent bursts.
+REDDIT_KEYLESS_LIMITER = RateLimiter(min_interval=0.5)
+
+
+def reddit_keyless_get_text(
+    url: str,
+    timeout: int = DEFAULT_TIMEOUT,
+    retries: int = 2,
+    accept: str = "*/*",
+    headers: Optional[Dict[str, str]] = None,
+) -> Optional[str]:
+    """get_text for the keyless Reddit tiers, throttled by a shared limiter.
+
+    Same contract as :func:`get_text` (returns None on any failure) but spaces
+    requests via :data:`REDDIT_KEYLESS_LIMITER` so a broad multi-query run does
+    not stampede Reddit's keyless endpoints and trip blocks.
+    """
+    REDDIT_KEYLESS_LIMITER.acquire()
+    return get_text(url, timeout=timeout, retries=retries, accept=accept, headers=headers)
 
 
 def scrapecreators_headers(token: str) -> Dict[str, str]:
