@@ -661,6 +661,49 @@ def fetch_transcripts_parallel(
     return results
 
 
+def backfill_transcripts(items: List[Any], topic: str = "", depth: str = "default") -> None:
+    """Second-pass transcript fetch for finalized items that lack one (#542)."""
+    limit = TRANSCRIPT_LIMITS.get(depth, TRANSCRIPT_LIMITS["default"])
+    if limit <= 0 or not items or not is_ytdlp_installed():
+        return
+    have = sum(
+        1 for it in items
+        if it.metadata.get("transcript_highlights") or it.metadata.get("transcript_snippet")
+    )
+    need = limit - have
+    if need <= 0:
+        return
+    missing = [
+        it for it in items
+        if it.item_id
+        and not it.metadata.get("transcript_highlights")
+        and not it.metadata.get("transcript_snippet")
+        and not it.metadata.get("captions_disabled")
+    ]
+    attempts = missing[: need * 3]
+    if not attempts:
+        return
+    _log(f"Backfilling transcripts for {len(attempts)} finalized videos (target: {need})")
+    captions_disabled: Set[str] = set()
+    transcripts = fetch_transcripts_parallel(
+        [it.item_id for it in attempts],
+        out_captions_disabled=captions_disabled,
+    )
+    for it in attempts:
+        if it.item_id in captions_disabled:
+            it.metadata["captions_disabled"] = True
+            continue
+        transcript = transcripts.get(it.item_id)
+        if not transcript:
+            continue
+        it.metadata["transcript_snippet"] = transcript
+        highlights = extract_transcript_highlights(transcript, topic)
+        if highlights:
+            it.metadata["transcript_highlights"] = highlights
+        if not it.snippet:
+            it.snippet = " ".join(transcript.split()[:80])
+
+
 def _transcript_candidate_sort_key(item: dict) -> tuple:
     """Sort key for transcript candidate selection.
 
