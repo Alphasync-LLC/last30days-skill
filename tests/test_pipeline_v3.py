@@ -198,7 +198,6 @@ class TestSourceFetchCap(unittest.TestCase):
 
     def test_cap_logic_limits_source_submissions(self):
         """Verify the cap logic skips submissions beyond the limit."""
-        cap = pipeline.MAX_SOURCE_FETCHES.get("x", float("inf"))
         subquery_sources = [
             ["x", "reddit", "youtube"],
             ["x", "reddit", "youtube"],
@@ -228,7 +227,7 @@ class TestSourceFetchCap(unittest.TestCase):
         mock_retrieve.side_effect = lambda **kwargs: pipeline._mock_stream_results(
             kwargs["source"], kwargs["subquery"]
         )
-        report = pipeline.run(
+        pipeline.run(
             topic="compare iPhone vs Android vs Pixel vs Samsung",
             config={"LAST30DAYS_REASONING_PROVIDER": "gemini"},
             depth="quick",
@@ -295,7 +294,7 @@ class TestRateLimitSharing(unittest.TestCase):
         self.assertEqual(artifact, {})
 
 
-class TestThinSourceRetry(unittest.TestCase):
+class TestThinSourceRetryPlannedSource(unittest.TestCase):
     @patch("lib.pipeline._retrieve_stream")
     def test_retry_includes_planned_source_with_zero_initial_items(self, mock_retrieve):
         mock_retrieve.return_value = (
@@ -398,6 +397,62 @@ def _make_source_item(source, item_id, url, author=None, body="", container=None
     )
 
 
+class TestXBackendChainAndFailover(unittest.TestCase):
+    """One X source, an ordered backend chain with failover; never parallel."""
+
+    @patch("lib.xurl_x.is_available", return_value=False)
+    def test_chain_orders_by_priority(self, _xurl):
+        from lib import env
+        chain = env.x_backend_chain({"XAI_API_KEY": "k", "XQUIK_API_KEY": "q"})
+        self.assertEqual(["xai", "xquik"], chain)  # xai primary, xquik backup
+
+    @patch("lib.xurl_x.is_available", return_value=False)
+    def test_pin_forces_single_backend(self, _xurl):
+        from lib import env
+        chain = env.x_backend_chain(
+            {"XAI_API_KEY": "k", "XQUIK_API_KEY": "q", "LAST30DAYS_X_BACKEND": "xquik"}
+        )
+        self.assertEqual(["xquik"], chain)  # pin = no failover
+
+    @patch("lib.xurl_x.is_available", return_value=False)
+    def test_chain_empty_when_nothing_configured(self, _xurl):
+        from lib import env
+        self.assertEqual([], env.x_backend_chain({}))
+
+    @patch("lib.env.x_backend_chain", return_value=["bird", "xquik"])
+    def test_failover_to_next_backend_on_empty(self, _chain):
+        sq = schema.SubQuery(label="primary", search_query="q", ranking_query="q?", sources=["x"])
+
+        def fake_fetch(backend, *a, **k):
+            if backend == "xquik":
+                return ([{"id": "XQ1", "url": "https://x.com/a/status/1"}], "")
+            return ([], "")  # bird returns nothing
+
+        with patch("lib.pipeline._fetch_x_backend", side_effect=fake_fetch):
+            items, _ = pipeline._retrieve_stream(
+                topic="q", subquery=sq, source="x", config={}, depth="default",
+                date_range=("2026-05-19", "2026-06-18"), runtime=_make_runtime(None), mock=False,
+            )
+        self.assertEqual(1, len(items))
+        self.assertEqual("XQ1", items[0]["id"])
+
+    @patch("lib.env.x_backend_chain", return_value=["xquik"])
+    def test_sole_backend_error_raises_honestly(self, _chain):
+        sq = schema.SubQuery(label="primary", search_query="q", ranking_query="q?", sources=["x"])
+        with patch("lib.pipeline._fetch_x_backend", return_value=([], "Xquik key unpaid (402)")):
+            with self.assertRaises(RuntimeError):
+                pipeline._retrieve_stream(
+                    topic="q", subquery=sq, source="x", config={}, depth="default",
+                    date_range=("2026-05-19", "2026-06-18"), runtime=_make_runtime(None), mock=False,
+                )
+
+    def test_xquik_is_not_a_separate_source(self):
+        # xquik registers only as a backend of "x", never its own source.
+        avail = pipeline.available_sources({"XQUIK_API_KEY": "k"})
+        self.assertIn("x", avail)
+        self.assertNotIn("xquik", avail)
+
+
 class TestSupplementalSearches(unittest.TestCase):
     """R1: Phase 2 entity drilling should be wired into the pipeline."""
 
@@ -454,6 +509,91 @@ class TestSupplementalSearches(unittest.TestCase):
         # Supplemental items should be merged into bundle
         x_urls = {item.url for item in bundle.items_by_source.get("x", [])}
         self.assertIn("https://x.com/analyst1/status/999", x_urls)
+
+    @patch("lib.env.x_backend_chain", return_value=["xquik"])
+    @patch("lib.xquik.search_xquik", return_value={"items": []})
+    def test_x_topic_lane_uses_anchored_query_via_xquik(self, mock_search, _chain):
+        """The X topic lane (here resolved to the xquik backend) consumes the
+        anchored subquery.search_query (#611), not the bare raw_topic."""
+        anchored = schema.SubQuery(
+            label="primary", search_query="kevin rose digg founder",
+            ranking_query="What has Kevin Rose, founder of Digg, been doing?",
+            sources=["x"],
+        )
+        pipeline._retrieve_stream(
+            topic="kevin rose digg founder", subquery=anchored, source="x",
+            config={"XQUIK_API_KEY": "k"}, depth="default",
+            date_range=("2026-05-19", "2026-06-18"), runtime=_make_runtime(None),
+            mock=False, raw_topic="kevin rose",
+        )
+        mock_search.assert_called_once()
+        self.assertEqual("kevin rose digg founder", mock_search.call_args[0][0])
+
+    @patch("lib.env.get_xquik_token", return_value="k")
+    @patch("lib.env.x_backend_chain", return_value=["xquik"])
+    @patch("lib.xquik.search_mentions", return_value=[])
+    @patch("lib.xquik.search_handles")
+    @patch("lib.entity_extract.extract_entities")
+    def test_handle_lanes_route_to_xquik_when_primary(
+        self, mock_extract, mock_xq_handles, mock_xq_mentions, *_patches
+    ):
+        """When xquik is the primary X backend, the FROM/ABOUT handle lanes run
+        via xquik and items land under the single 'x' slug."""
+        mock_extract.return_value = {"x_handles": ["analyst1"], "x_hashtags": [], "reddit_subreddits": []}
+        mock_xq_handles.return_value = [{
+            "id": "XF1", "text": "from analyst1", "url": "https://x.com/analyst1/status/777",
+            "author_handle": "analyst1", "date": "2026-03-15",
+            "engagement": {"likes": 30}, "relevance": 0.8, "why_relevant": "",
+        }]
+
+        bundle = schema.RetrievalBundle()
+        bundle.items_by_source["x"] = [
+            _make_source_item("x", "X1", "https://x.com/analyst1/status/1", author="analyst1", body="tweet about AI"),
+        ]
+
+        pipeline._run_supplemental_searches(
+            topic="AI safety", bundle=bundle, plan=_make_plan("AI safety"), config={},
+            depth="default", date_range=("2026-02-15", "2026-03-17"),
+            runtime=_make_runtime(None), mock=False,
+            rate_limited_sources=set(), rate_limit_lock=threading.Lock(),
+        )
+
+        mock_xq_handles.assert_called_once()
+        x_urls = {item.url for item in bundle.items_by_source.get("x", [])}
+        self.assertIn("https://x.com/analyst1/status/777", x_urls)
+        # There is no separate 'xquik' source — everything is under 'x'.
+        self.assertNotIn("xquik", bundle.items_by_source)
+
+    @patch("lib.env.get_xquik_token", return_value="k")
+    @patch("lib.env.x_backend_chain", return_value=["xai", "xquik"])
+    @patch("lib.xquik.search_mentions", return_value=[])
+    @patch("lib.xquik.search_handles")
+    @patch("lib.entity_extract.extract_entities")
+    def test_handle_lanes_use_xquik_when_xai_is_primary(
+        self, mock_extract, mock_xq_handles, *_patches
+    ):
+        """When xAI is the topic primary but xquik is in the chain, the
+        supplemental handle lanes still run via xquik (first handle-capable
+        backend) rather than being skipped."""
+        mock_extract.return_value = {"x_handles": ["analyst1"], "x_hashtags": [], "reddit_subreddits": []}
+        mock_xq_handles.return_value = [{
+            "id": "XF1", "text": "from analyst1", "url": "https://x.com/analyst1/status/888",
+            "author_handle": "analyst1", "date": "2026-03-15",
+            "engagement": {"likes": 5}, "relevance": 0.8, "why_relevant": "",
+        }]
+        bundle = schema.RetrievalBundle()
+        bundle.items_by_source["x"] = [
+            _make_source_item("x", "X1", "https://x.com/analyst1/status/1", author="analyst1", body="tweet"),
+        ]
+        pipeline._run_supplemental_searches(
+            topic="AI safety", bundle=bundle, plan=_make_plan("AI safety"), config={},
+            depth="default", date_range=("2026-02-15", "2026-03-17"),
+            runtime=_make_runtime("xai"), mock=False,
+            rate_limited_sources=set(), rate_limit_lock=threading.Lock(),
+        )
+        mock_xq_handles.assert_called_once()
+        x_urls = {item.url for item in bundle.items_by_source.get("x", [])}
+        self.assertIn("https://x.com/analyst1/status/888", x_urls)
 
     @patch("lib.bird_x.search_handles")
     @patch("lib.entity_extract.extract_entities")
@@ -740,7 +880,6 @@ class TestThinSourceRetry(unittest.TestCase):
             )
             # x (non-errored, thin) should be retried; reddit (errored) should not
             if mock_retrieve.call_count > 0:
-                retried_sources = [call.kwargs.get("source") or call.args[2] for call in mock_retrieve.call_args_list if hasattr(call, 'kwargs')]
                 self.assertNotIn("reddit", [c.kwargs.get("source") for c in mock_retrieve.call_args_list])
 
     def test_retry_skipped_in_quick_mode(self):
@@ -1118,6 +1257,23 @@ class TestExcludeSources(unittest.TestCase):
         sources = pipeline.available_sources(config)
         self.assertNotIn("hackernews", sources)
         self.assertIn("reddit", sources)
+
+
+class TestPerplexityAvailability(unittest.TestCase):
+    def test_perplexity_source_not_available_with_direct_key_without_opt_in(self):
+        sources = pipeline.available_sources({"PERPLEXITY_API_KEY": "test-key"})
+        self.assertNotIn("perplexity", sources)
+
+    def test_perplexity_source_available_with_direct_key(self):
+        sources = pipeline.available_sources(
+            {"PERPLEXITY_API_KEY": "test-key", "INCLUDE_SOURCES": "perplexity"}
+        )
+        self.assertIn("perplexity", sources)
+
+    def test_perplexity_diagnose_reports_direct_provider(self):
+        diag = pipeline.diagnose({"PERPLEXITY_API_KEY": "test-key"})
+        self.assertTrue(diag["providers"]["perplexity"])
+        self.assertTrue(diag["local_mode"])
 
 
 class TestKeylessGroundingAvailability(unittest.TestCase):

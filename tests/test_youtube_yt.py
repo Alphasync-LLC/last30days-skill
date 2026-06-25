@@ -154,6 +154,37 @@ class TestYtDlpSubLangs(unittest.TestCase):
         self.assertIsNotNone(vtt)
         self.assertIn("Hola mundo", vtt)
 
+    def test_partial_success_returns_vtt_despite_nonzero_exit(self):
+        """A non-zero yt-dlp exit must not discard a VTT already on disk.
+
+        Regression for the 0/N-transcripts bug: with the default
+        ``--sub-lang en,es,pt``, an English video fetches ``en`` successfully,
+        then ``es``/``pt`` hit a 429 and yt-dlp exits non-zero. The ``en``
+        track is already written and must be returned, not discarded (and not
+        retried back into the same rate limit).
+        """
+        with tempfile.TemporaryDirectory() as temp_dir:
+            (Path(temp_dir) / "abc123.en.vtt").write_text(
+                "WEBVTT\n\n00:00:00.000 --> 00:00:02.000\nThis is the english transcript.\n",
+                encoding="utf-8",
+            )
+            status: dict = {}
+            with mock.patch.object(youtube_yt, "is_ytdlp_installed", return_value=True), \
+                 mock.patch.object(
+                     youtube_yt.subproc,
+                     "run_with_timeout",
+                     return_value=self._fake_result(returncode=1),
+                 ) as run_mock:
+                vtt = youtube_yt._fetch_transcript_ytdlp("abc123", temp_dir, status)
+
+        self.assertIsNotNone(vtt)
+        self.assertIn("english transcript", vtt)
+        self.assertNotIn("ytdlp_error", status)
+        # Salvage must short-circuit the retry loop: yt-dlp must not be called a
+        # second time when a partial VTT is already on disk (locks in the
+        # no-retry guarantee against a future salvage-after-retry regression).
+        self.assertEqual(run_mock.call_count, 1)
+
     def test_vtt_matching_respects_non_default_priority(self):
         """When multiple tracks exist, the user-requested priority wins
         over alphabetical order (regression for the Greptile review on #486)."""
@@ -344,7 +375,7 @@ class TestFetchTranscriptFallback(unittest.TestCase):
              mock.patch.object(youtube_yt, "_fetch_transcript_ytdlp", return_value="WEBVTT\n\nfake") as yt_mock, \
              mock.patch.object(youtube_yt, "_fetch_transcript_direct") as direct_mock:
             result = youtube_yt.fetch_transcript("vid1", "/tmp/test")
-        yt_mock.assert_called_once_with("vid1", "/tmp/test", status=None)
+        yt_mock.assert_called_once_with("vid1", "/tmp/test", status=None, fast_fail=False)
         direct_mock.assert_not_called()
 
     def test_uses_direct_when_ytdlp_missing(self):
@@ -487,7 +518,7 @@ class TestTranscriptCandidateSortKey(unittest.TestCase):
 
         call_args_list = []
 
-        def fake_fetch(video_ids, max_workers=5, out_captions_disabled=None):
+        def fake_fetch(video_ids, max_workers=5, out_captions_disabled=None, token=None):
             call_args_list.extend(video_ids)
             return {vid: "transcript" for vid in video_ids}
 
@@ -528,7 +559,7 @@ class TestSearchAndTranscribe(unittest.TestCase):
         ]
 
         # fetch_transcripts_parallel returns None for music videos, text for talks
-        def fake_parallel(video_ids, max_workers=5, out_captions_disabled=None):
+        def fake_parallel(video_ids, max_workers=5, out_captions_disabled=None, token=None):
             result = {}
             for vid in video_ids:
                 if vid.startswith("talk"):
@@ -598,7 +629,7 @@ class TestTranscriptFetchStats(unittest.TestCase):
 
     def _run(self, items, fake_parallel=None):
         if fake_parallel is None:
-            def fake_parallel(video_ids, max_workers=5, out_captions_disabled=None):
+            def fake_parallel(video_ids, max_workers=5, out_captions_disabled=None, token=None):
                 return {vid: "A detailed transcript about the topic." for vid in video_ids}
         with mock.patch.object(youtube_yt, "search_youtube", return_value={"items": items}), \
              mock.patch.object(youtube_yt, "fetch_transcripts_parallel", side_effect=fake_parallel):
@@ -613,7 +644,7 @@ class TestTranscriptFetchStats(unittest.TestCase):
             self._make_item("nocap1", 1_000, "2026-03-10"),
         ]
 
-        def fake_parallel(video_ids, max_workers=5, out_captions_disabled=None):
+        def fake_parallel(video_ids, max_workers=5, out_captions_disabled=None, token=None):
             result = {}
             for vid in video_ids:
                 if vid.startswith("nocap"):
@@ -827,6 +858,214 @@ class TestTranscriptSSHRouting(unittest.TestCase):
         local_mock.assert_not_called()
         direct_mock.assert_not_called()
         self.assertIn("hello there friends", result)
+
+
+class TestScTranscriptFallback(unittest.TestCase):
+    """ScrapeCreators fallback wiring in fetch_transcript (U1/U2)."""
+
+    def _ytdlp_hard_fail(self, reason="HTTP Error 429: Too Many Requests"):
+        def _fake(video_id, temp_dir, status=None, fast_fail=False):
+            if status is not None:
+                status["ytdlp_error"] = reason
+            return None
+        return _fake
+
+    def test_sc_fallback_fires_on_ytdlp_hard_failure_with_token(self):
+        """A yt-dlp hard failure (429) with a key falls back to ScrapeCreators."""
+        status = {}
+        with mock.patch.object(youtube_yt, "is_ytdlp_installed", return_value=True), \
+             mock.patch.object(youtube_yt, "_fetch_transcript_ytdlp",
+                               side_effect=self._ytdlp_hard_fail()), \
+             mock.patch.object(youtube_yt, "_fetch_transcript_direct") as direct_mock, \
+             mock.patch.object(youtube_yt, "_sc_fetch_transcript",
+                               return_value="scrapecreators transcript text") as sc_mock:
+            result = youtube_yt.fetch_transcript("vidA", "/tmp/x", status=status, token="key123")
+        sc_mock.assert_called_once_with("vidA", "key123")
+        direct_mock.assert_not_called()  # hard error skips the (also-blocked) direct path
+        self.assertEqual(result, "scrapecreators transcript text")
+
+    def test_sc_not_called_when_ytdlp_succeeds(self):
+        """No credit is spent when yt-dlp returns a transcript."""
+        with mock.patch.object(youtube_yt, "is_ytdlp_installed", return_value=True), \
+             mock.patch.object(youtube_yt, "_fetch_transcript_ytdlp",
+                               return_value="WEBVTT\n\nreal captions here"), \
+             mock.patch.object(youtube_yt, "_sc_fetch_transcript") as sc_mock:
+            result = youtube_yt.fetch_transcript("vidB", "/tmp/x", status={}, token="key123")
+        sc_mock.assert_not_called()
+        self.assertIn("real captions", result)
+
+    def test_sc_not_called_without_token(self):
+        """Keyless behavior unchanged: no token means no ScrapeCreators."""
+        status = {}
+        with mock.patch.object(youtube_yt, "is_ytdlp_installed", return_value=True), \
+             mock.patch.object(youtube_yt, "_fetch_transcript_ytdlp",
+                               side_effect=self._ytdlp_hard_fail()), \
+             mock.patch.object(youtube_yt, "_sc_fetch_transcript") as sc_mock:
+            result = youtube_yt.fetch_transcript("vidC", "/tmp/x", status=status, token=None)
+        sc_mock.assert_not_called()
+        self.assertIsNone(result)
+
+    def test_sc_skipped_when_proven_captionless(self):
+        """A video proven to have no caption track must not spend a credit."""
+        def _ytdlp_no_captions(video_id, temp_dir, status=None, fast_fail=False):
+            return None  # exit-0 no captions: returns None, no ytdlp_error
+
+        def _direct_no_tracks(video_id, status=None):
+            if status is not None:
+                status["no_caption_tracks"] = True
+            return None
+
+        status = {}
+        with mock.patch.object(youtube_yt, "is_ytdlp_installed", return_value=True), \
+             mock.patch.object(youtube_yt, "_fetch_transcript_ytdlp", side_effect=_ytdlp_no_captions), \
+             mock.patch.object(youtube_yt, "_fetch_transcript_direct", side_effect=_direct_no_tracks), \
+             mock.patch.object(youtube_yt, "_sc_fetch_transcript") as sc_mock:
+            result = youtube_yt.fetch_transcript("vidD", "/tmp/x", status=status, token="key123")
+        sc_mock.assert_not_called()
+        self.assertIsNone(result)
+
+    def test_should_try_sc_transcript_predicate(self):
+        self.assertTrue(youtube_yt._should_try_sc_transcript(None))
+        self.assertTrue(youtube_yt._should_try_sc_transcript({}))
+        self.assertTrue(youtube_yt._should_try_sc_transcript({"ytdlp_error": "429"}))
+        self.assertFalse(youtube_yt._should_try_sc_transcript({"no_caption_tracks": True}))
+
+    def test_token_threads_through_parallel(self):
+        """fetch_transcripts_parallel passes the token to every fetch_transcript."""
+        captured = {}
+
+        def _fake_fetch_transcript(video_id, temp_dir, status=None, token=None):
+            captured[video_id] = token
+            return None
+
+        with mock.patch.object(youtube_yt, "fetch_transcript", side_effect=_fake_fetch_transcript):
+            youtube_yt.fetch_transcripts_parallel(["v1", "v2"], token="tok")
+        self.assertEqual(captured, {"v1": "tok", "v2": "tok"})
+
+
+class TestYtdlpFastFail(unittest.TestCase):
+    """Fail-fast behavior when a ScrapeCreators key is present (U3)."""
+
+    def _transient_fail(self):
+        from lib.subproc import SubprocResult
+        return SubprocResult(
+            returncode=1, stdout="",
+            stderr="ERROR: HTTP Error 429: Too Many Requests",
+        )
+
+    def test_fast_fail_single_attempt_short_timeout(self):
+        """token present -> one attempt, shortened timeout, no retry sleeps."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            status = {}
+            with mock.patch.object(youtube_yt, "is_ytdlp_installed", return_value=True), \
+                 mock.patch.object(youtube_yt.subproc, "run_with_timeout",
+                                   return_value=self._transient_fail()) as run_mock, \
+                 mock.patch.object(youtube_yt.time, "sleep") as sleep_mock:
+                vtt = youtube_yt._fetch_transcript_ytdlp("vidF", temp_dir, status, fast_fail=True)
+        self.assertIsNone(vtt)
+        self.assertEqual(run_mock.call_count, 1)  # no retries
+        self.assertEqual(run_mock.call_args.kwargs.get("timeout"), 12)
+        sleep_mock.assert_not_called()
+        self.assertIn("ytdlp_error", status)
+
+    def test_no_token_retries_with_full_timeout(self):
+        """token absent -> full retry budget and 30s timeout, unchanged."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            status = {}
+            with mock.patch.object(youtube_yt, "is_ytdlp_installed", return_value=True), \
+                 mock.patch.object(youtube_yt.subproc, "run_with_timeout",
+                                   return_value=self._transient_fail()) as run_mock, \
+                 mock.patch.object(youtube_yt.time, "sleep"):
+                vtt = youtube_yt._fetch_transcript_ytdlp("vidG", temp_dir, status, fast_fail=False)
+        self.assertIsNone(vtt)
+        self.assertEqual(run_mock.call_count, youtube_yt._TRANSCRIPT_MAX_RETRIES + 1)
+        self.assertEqual(run_mock.call_args.kwargs.get("timeout"), 30)
+
+
+class TestScTranscriptParsing(unittest.TestCase):
+    """ScrapeCreators transcript parse + credits warning (U4)."""
+
+    def test_list_of_dict_segments_parsed_to_text(self):
+        payload = {
+            "transcript": [
+                {"text": "hello there", "startMs": 0, "endMs": 1000},
+                {"text": "general kenobi", "startMs": 1000, "endMs": 2000},
+            ],
+            "credits_remaining": 9999,
+        }
+        with mock.patch.object(youtube_yt.http, "get", return_value=payload):
+            result = youtube_yt._sc_fetch_transcript("vidH", "key")
+        self.assertIsNotNone(result)
+        self.assertIn("hello there", result)
+        self.assertIn("general kenobi", result)
+        self.assertNotIn("startMs", result)
+        self.assertNotIn("{'text'", result)
+
+    def test_null_text_segment_does_not_emit_none(self):
+        """A present-but-null text field (silent/music segment) must not become "None"."""
+        payload = {
+            "transcript": [
+                {"text": "real words here", "startMs": 0},
+                {"text": None, "startMs": 1000},
+                {"text": "more real words", "startMs": 2000},
+            ],
+            "credits_remaining": 9999,
+        }
+        with mock.patch.object(youtube_yt.http, "get", return_value=payload):
+            result = youtube_yt._sc_fetch_transcript("vidNull", "key")
+        self.assertIsNotNone(result)
+        self.assertNotIn("None", result)
+        self.assertIn("real words here", result)
+        self.assertIn("more real words", result)
+
+    def test_plain_string_transcript_preserved(self):
+        payload = {"transcript": "just a plain transcript string here", "credits_remaining": 9999}
+        with mock.patch.object(youtube_yt.http, "get", return_value=payload):
+            result = youtube_yt._sc_fetch_transcript("vidI", "key")
+        self.assertIn("just a plain transcript", result)
+
+    def test_low_credits_emits_warning(self):
+        payload = {"transcript": "some transcript text", "credits_remaining": 5}
+        logs = []
+        with mock.patch.object(youtube_yt.http, "get", return_value=payload), \
+             mock.patch.object(youtube_yt, "_log", side_effect=lambda m: logs.append(m)):
+            youtube_yt._sc_fetch_transcript("vidJ", "key")
+        self.assertTrue(any("credits low" in m.lower() for m in logs))
+
+    def test_healthy_credits_no_warning(self):
+        payload = {"transcript": "some transcript text", "credits_remaining": 9999}
+        logs = []
+        with mock.patch.object(youtube_yt.http, "get", return_value=payload), \
+             mock.patch.object(youtube_yt, "_log", side_effect=lambda m: logs.append(m)):
+            youtube_yt._sc_fetch_transcript("vidK", "key")
+        self.assertFalse(any("credits low" in m.lower() for m in logs))
+
+
+class TestYoutubeCommentsGating(unittest.TestCase):
+    """YouTube comments default-on gating (U5)."""
+
+    def test_default_on_with_key_and_no_include_sources(self):
+        from lib import env
+        self.assertTrue(env.is_youtube_comments_available({"SCRAPECREATORS_API_KEY": "k"}))
+
+    def test_unavailable_without_key(self):
+        from lib import env
+        self.assertFalse(env.is_youtube_comments_available({}))
+
+    def test_exclude_sources_suppresses(self):
+        from lib import env
+        cfg = {"SCRAPECREATORS_API_KEY": "k", "EXCLUDE_SOURCES": "youtube_comments"}
+        self.assertFalse(env.is_youtube_comments_available(cfg))
+
+    def test_tiktok_comments_still_opt_in(self):
+        """Regression: TikTok comments must STILL require INCLUDE_SOURCES."""
+        from lib import env
+        self.assertFalse(
+            env.is_tiktok_comments_available({"SCRAPECREATORS_API_KEY": "k"})
+        )
+        self.assertTrue(env.is_tiktok_comments_available(
+            {"SCRAPECREATORS_API_KEY": "k", "INCLUDE_SOURCES": "tiktok_comments"}
+        ))
 
 
 if __name__ == "__main__":

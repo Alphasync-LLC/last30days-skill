@@ -24,10 +24,15 @@ def ensure_supported_python(version_info: tuple[int, int, int] | object | None =
     major, minor, micro = tuple(version_info[:3])
     if (major, minor) >= MIN_PYTHON:
         return
+    req = f"{MIN_PYTHON[0]}.{MIN_PYTHON[1]}"
     sys.stderr.write(
-        "last30days v3 requires Python 3.12+.\n"
+        f"last30days v3 requires Python {req}+.\n"
         f"Detected Python {major}.{minor}.{micro}.\n"
-        "Install and use python3.12 or python3.13, then rerun this command.\n"
+        f"Install with:\n"
+        f"  Mac:     brew install python@{req}\n"
+        f"  Windows: winget install Python.Python.{req}\n"
+        f"  Linux:   sudo apt install python{req}  (or pyenv install {req})\n"
+        f"Then rerun: python{req} <path-to-script> setup\n"
     )
     raise SystemExit(1)
 
@@ -288,6 +293,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--debug", action="store_true", help="Enable HTTP debug logging")
     parser.add_argument("--mock", action="store_true", help="Use mock retrieval fixtures")
     parser.add_argument("--diagnose", action="store_true", help="Print provider and source availability")
+    parser.add_argument("--no-browser-cookies", action="store_true",
+                        help="Disable browser-cookie extraction even when FROM_BROWSER is configured")
     parser.add_argument("--save-dir", help="Optional directory for saving the rendered output")
     parser.add_argument("--output", help="Optional exact file path for saving the rendered output")
     parser.add_argument("--synthesis-file", help="Markdown synthesis to embed in --emit=html output")
@@ -298,7 +305,7 @@ def build_parser() -> argparse.ArgumentParser:
                         choices=["auto", "brave", "exa", "serper", "parallel", "none"],
                         help="Web search backend (default: auto, tries Brave then Exa then Serper then Parallel)")
     parser.add_argument("--deep-research", action="store_true",
-                        help="Use Perplexity Deep Research (~$0.90/query) for in-depth analysis. Requires OPENROUTER_API_KEY.")
+                        help="Use Perplexity Deep Research (~$0.90/query) for in-depth analysis. Requires PERPLEXITY_API_KEY or OPENROUTER_API_KEY.")
     parser.add_argument("--hiring-signals", action="store_true",
                         help="Analyze public jobs/careers postings as evidence-backed company focus signals.")
     parser.add_argument("--plan", help="JSON query plan (skips internal LLM planner). Can be a JSON string or a file path.")
@@ -613,7 +620,7 @@ def _write_last_run(topic: str, report: "schema.Report") -> None:
         pass
 
 
-def _propagate_config_to_environ() -> None:
+def _propagate_config_to_environ(config: dict[str, object]) -> None:
     """Push relevant env keys to os.environ so provider modules can read them.
 
     The env.get_config() function reads from a .env file, but providers.py
@@ -621,17 +628,71 @@ def _propagate_config_to_environ() -> None:
     XAI_BASE_URL overrides are silently ignored. This is a no-op for
     keys that are already set in process env.
     """
-    try:
-        config = env.get_config()
-    except Exception:
-        return
     for key in ("OPENAI_BASE_URL", "XAI_BASE_URL"):
         val = config.get(key)
         if val and not os.environ.get(key):
             os.environ[key] = val
 
 
-_propagate_config_to_environ()
+def _setup_allows_browser_cookies(args: argparse.Namespace, extra_argv: list[str]) -> bool:
+    return (
+        not args.no_browser_cookies
+        and not args.diagnose
+        and "--allow-browser-cookies" in extra_argv
+    )
+
+
+SETUP_PASSTHROUGH_FLAGS = {
+    "--allow-browser-cookies",
+    "--device-auth",
+    "--github",
+    "--openclaw",
+}
+
+SKILL_ONLY_FLAGS = {
+    "--agent",
+}
+
+
+def _validate_extra_argv(parser: argparse.ArgumentParser, topic: str, extra_argv: list[str]) -> None:
+    if not extra_argv:
+        return
+    if topic.lower() == "setup":
+        unsupported = [arg for arg in extra_argv if arg not in SETUP_PASSTHROUGH_FLAGS]
+        if unsupported:
+            parser.error(
+                "unsupported setup argument(s): "
+                + ", ".join(unsupported)
+                + f"; supported setup passthrough flags are {', '.join(sorted(SETUP_PASSTHROUGH_FLAGS))}"
+            )
+        return
+    skill_only = [arg for arg in extra_argv if arg in SKILL_ONLY_FLAGS]
+    other_unknown = [arg for arg in extra_argv if arg not in SKILL_ONLY_FLAGS]
+    if skill_only:
+        message = (
+            "unsupported Python CLI argument(s): "
+            + ", ".join(skill_only)
+            + "; these are skill arguments and must not be forwarded to scripts/last30days.py"
+        )
+        if other_unknown:
+            message += "; also unsupported: " + ", ".join(other_unknown)
+        parser.error(message)
+    parser.error("unsupported Python CLI argument(s): " + ", ".join(extra_argv))
+
+
+def _config_policy_for_args(args: argparse.Namespace, topic: str, extra_argv: list[str]) -> env.ConfigLoadPolicy:
+    if args.no_browser_cookies:
+        browser_mode = "off"
+    elif args.diagnose:
+        browser_mode = "plan_only"
+    elif topic.lower() == "setup":
+        browser_mode = "read" if _setup_allows_browser_cookies(args, extra_argv) else "off"
+    else:
+        browser_mode = "read"
+    return env.ConfigLoadPolicy(
+        browser_cookies=browser_mode,
+        inspect_ignored_project_config=args.diagnose,
+    )
 
 
 def main() -> int:
@@ -642,7 +703,10 @@ def main() -> int:
     if args.debug:
         os.environ["LAST30DAYS_DEBUG"] = "1"
 
-    config = env.get_config()
+    topic = " ".join(args.topic).strip()
+    _validate_extra_argv(parser, topic, extra_argv)
+    config = env.get_config(policy=_config_policy_for_args(args, topic, extra_argv))
+    _propagate_config_to_environ(config)
 
     # Env-var fallback for --save-dir, mirroring the LAST30DAYS_STORE pattern below.
     # Uses `is None` / `is not None` checks (not truthy `or`) at every layer so that
@@ -661,30 +725,40 @@ def main() -> int:
         os.environ["LAST30DAYS_YOUTUBE_SSH_HOST"] = config["LAST30DAYS_YOUTUBE_SSH_HOST"]
 
     # Handle setup subcommand
-    topic = " ".join(args.topic).strip()
     if topic.lower() == "setup":
         from lib import setup_wizard
         if "--openclaw" in extra_argv:
             results = setup_wizard.run_openclaw_setup(config)
             print(json.dumps(results))
             return 0
-        if "--github" in extra_argv:
-            results = setup_wizard.run_github_auth()
-            print(json.dumps(results))
-            return 0
-        if "--device-auth" in extra_argv:
-            results = setup_wizard.run_full_device_auth()
+        if "--github" in extra_argv or "--device-auth" in extra_argv:
+            if "--github" in extra_argv:
+                results = setup_wizard.run_github_auth()
+            else:
+                results = setup_wizard.run_full_device_auth()
+            # Persist the returned key so the paid sources activate on the next
+            # run, and mask it in stdout so the secret never lands in the host
+            # model's captured Bash output.
+            api_key = results.get("api_key")
+            if results.get("status") == "success" and api_key:
+                results["persisted"] = setup_wizard.write_api_key(env.CONFIG_FILE, api_key)
+                results["api_key"] = setup_wizard.mask_api_key(api_key)
+            else:
+                results["persisted"] = False
             print(json.dumps(results))
             return 0
         sys.stderr.write("Running auto-setup...\n")
-        results = setup_wizard.run_auto_setup(config)
+        results = setup_wizard.run_auto_setup(
+            config,
+            allow_browser_cookies=_setup_allows_browser_cookies(args, extra_argv),
+        )
         # Persist FROM_BROWSER only when every service's cookies came from the
         # SAME single browser — then we can fast-path future runs to it. If
         # different services matched different browsers, or none matched, leave
-        # FROM_BROWSER unset: the safe default (Firefox/Safari) then covers all
-        # of them with no Keychain prompt. We deliberately do NOT pin "auto"
-        # here (it would re-probe Chrome and re-trigger the prompt) nor a single
-        # browser (it would silently skip the service that used the other one).
+        # FROM_BROWSER unset so the safe default remains no browser-cookie
+        # reads. We deliberately do NOT pin "auto" here (it would re-probe
+        # Chrome and re-trigger the prompt) nor a single browser (it would
+        # silently skip the service that used the other one).
         found_browsers = set(results.get("cookies_found", {}).values())
         from_browser = found_browsers.pop() if len(found_browsers) == 1 else None
         setup_wizard.write_setup_config(env.CONFIG_FILE, from_browser=from_browser)
@@ -693,7 +767,7 @@ def main() -> int:
         return 0
 
     requested_sources = resolve_requested_sources(args.search, config)
-    diag = pipeline.diagnose(config, requested_sources)
+    diag = pipeline.diagnose(config, requested_sources, safe=args.diagnose)
 
     if args.diagnose:
         print(json.dumps(diag, indent=2, sort_keys=True))
@@ -742,6 +816,10 @@ def main() -> int:
                 external_plan = _json.loads(plan_str)
             except _json.JSONDecodeError as exc:
                 sys.stderr.write(f"[Planner] Invalid --plan JSON: {exc}\n")
+                # Fail fast instead of silently dropping to the internal planner
+                # and burning a paid run the user did not ask for. Mirrors the
+                # --plan file-read branch above and parse_competitors_plan.
+                raise SystemExit(2)
 
         # Auto-resolve: use web search to discover subreddits/handles before planning.
         # This is the engine-side equivalent of SKILL.md Steps 0.55/0.75 for platforms
@@ -792,8 +870,8 @@ def main() -> int:
 
         # --deep-research: auto-enable perplexity source and set deep flag
         if args.deep_research:
-            if not config.get("OPENROUTER_API_KEY"):
-                print("Error: --deep-research requires OPENROUTER_API_KEY", file=sys.stderr)
+            if not (config.get("PERPLEXITY_API_KEY") or config.get("OPENROUTER_API_KEY")):
+                print("Error: --deep-research requires PERPLEXITY_API_KEY or OPENROUTER_API_KEY", file=sys.stderr)
                 sys.exit(1)
             config["_deep_research"] = True
             # Auto-enable perplexity in INCLUDE_SOURCES
@@ -889,7 +967,7 @@ def main() -> int:
                         "\n"
                         "HEADLESS / CRON PATH (no hosting model available): set "
                         "BRAVE_API_KEY / EXA_API_KEY / SERPER_API_KEY / PARALLEL_API_KEY / "
-                        "OPENROUTER_API_KEY and re-run.\n"
+                        "PERPLEXITY_API_KEY / OPENROUTER_API_KEY and re-run.\n"
                         "\n"
                         "MINIMUM ESCAPE HATCH: pass --competitors-list 'A,B,C' to skip "
                         "discovery. Without --competitors-plan, peer sub-runs fall back to "

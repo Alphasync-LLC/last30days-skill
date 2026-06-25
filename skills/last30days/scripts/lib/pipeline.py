@@ -63,7 +63,7 @@ SEARCH_ALIAS = {
     "truth": "truthsocial",
     "web": "grounding",
     "xhs": "xiaohongshu",
-    "xquik": "xquik",
+    "xquik": "x",  # xquik is a backend of the single "x" source, not its own source
 }
 
 MAX_SOURCE_FETCHES: dict[str, int] = {"x": 2, "jobs": 1}
@@ -75,6 +75,10 @@ MAX_SOURCE_FETCHES: dict[str, int] = {"x": 2, "jobs": 1}
 FROM_LANE_COUNT_PER = 8
 MENTION_LANE_COUNT_PER = 5
 RELATED_HANDLE_COUNT_PER = 3
+
+
+def _has_perplexity_provider(config: dict[str, Any]) -> bool:
+    return bool(config.get("PERPLEXITY_API_KEY") or config.get("OPENROUTER_API_KEY"))
 
 MOCK_AVAILABLE_SOURCES = [
     "reddit",
@@ -92,7 +96,6 @@ MOCK_AVAILABLE_SOURCES = [
     "perplexity",
     "threads",
     "pinterest",
-    "xquik",
     "digg",
     "jobs",
 ]
@@ -141,7 +144,7 @@ def available_sources(config: dict[str, Any], requested_sources: list[str] | Non
         available.append("jobs")
     # Perplexity Sonar: opt-in additive source via INCLUDE_SOURCES=perplexity
     include_sources = (config.get("INCLUDE_SOURCES") or "").lower().split(",")
-    if config.get("OPENROUTER_API_KEY") and (
+    if _has_perplexity_provider(config) and (
         "perplexity" in include_sources or (requested_sources and "perplexity" in requested_sources)
     ):
         available.append("perplexity")
@@ -151,18 +154,23 @@ def available_sources(config: dict[str, Any], requested_sources: list[str] | Non
         available.append("threads")
     if requested_sources and "pinterest" in requested_sources and env.is_pinterest_available(config):
         available.append("pinterest")
-    if env.is_xquik_available(config):
-        available.append("xquik")
+    # xquik is a backend of the single "x" source (see env.x_backend_chain),
+    # not a separate parallel source — registered via the "x" entry above.
     exclude = {s.strip().lower() for s in (config.get("EXCLUDE_SOURCES") or "").split(",") if s.strip()}
     if exclude:
         available = [s for s in available if s not in exclude]
     return available
 
 
-def diagnose(config: dict[str, Any], requested_sources: list[str] | None = None) -> dict[str, Any]:
+def diagnose(
+    config: dict[str, Any],
+    requested_sources: list[str] | None = None,
+    *,
+    safe: bool = False,
+) -> dict[str, Any]:
     requested_sources = normalize_requested_sources(requested_sources)
     google_key = _google_key(config)
-    x_status = env.get_x_source_status(config, probe=True)
+    x_status = env.get_x_source_status(config, probe=not safe)
     native_web_backend = None
     if config.get("BRAVE_API_KEY"):
         native_web_backend = "brave"
@@ -177,20 +185,64 @@ def diagnose(config: dict[str, Any], requested_sources: list[str] | None = None)
         "openai": bool(config.get("OPENAI_API_KEY")) and config.get("OPENAI_AUTH_STATUS") == env.AUTH_STATUS_OK,
         "xai": bool(config.get("XAI_API_KEY")),
         "openrouter": bool(config.get("OPENROUTER_API_KEY")),
+        "perplexity": bool(config.get("PERPLEXITY_API_KEY")),
     }
+    reasoning_provider_available = any(
+        providers_status[name] for name in ("google", "openai", "xai", "openrouter")
+    )
+    external_commands = {
+        "yt-dlp": bool(which("yt-dlp")),
+        "digg-pp-cli": bool(which("digg-pp-cli")),
+        "gh": bool(which("gh")),
+    }
+    credential_destinations = {
+        "global_env": str(env.CONFIG_FILE) if env.CONFIG_FILE else None,
+    }
+    browser_cookies = {
+        "mode": config.get("_BROWSER_COOKIE_MODE", "off"),
+        "browsers": list(config.get("_BROWSER_COOKIE_BROWSERS") or []),
+        "reads_values": False if safe else config.get("_BROWSER_COOKIE_MODE") == "read",
+    }
+    ignored_project_keys = list(config.get("_IGNORED_PROJECT_CONFIG_KEYS") or [])
+    endpoint_override_keys = {
+        "BSKY_SEARCH_HOST",
+        "LAST30DAYS_SEARXNG_URL",
+        "LAST30DAYS_YOUTUBE_SSH_HOST",
+        "OPENAI_BASE_URL",
+        "XAI_BASE_URL",
+        "XIAOHONGSHU_API_BASE",
+    }
+    ignored_endpoint_overrides = [
+        key for key in ignored_project_keys if key in endpoint_override_keys
+    ]
+    local_writes: list[dict[str, str]] = []
+    if config.get("LAST30DAYS_MEMORY_DIR"):
+        local_writes.append({"kind": "report", "path": str(config.get("LAST30DAYS_MEMORY_DIR"))})
     return {
         "providers": providers_status,
-        "local_mode": not any(providers_status.values()),
+        "local_mode": not reasoning_provider_available,
         "reasoning_provider": (config.get("LAST30DAYS_REASONING_PROVIDER") or "auto").lower(),
         "x_backend": x_status["source"],
         "bird_installed": x_status["bird_installed"],
         "bird_authenticated": x_status["bird_authenticated"],
         "bird_username": x_status["bird_username"],
+        "xquik_available": x_status.get("xquik_available", False),
+        "xquik_working": x_status.get("xquik_working"),
+        "xquik_status": x_status.get("xquik_status", ""),
         "native_web_backend": native_web_backend,
         "native_search": env.is_native_search(config),
         "has_scrapecreators": bool(config.get("SCRAPECREATORS_API_KEY")),
         "has_github": bool(config.get("GITHUB_TOKEN") or which("gh")),
         "available_sources": available_sources(config, requested_sources),
+        "safe": safe,
+        "config_source": config.get("_CONFIG_SOURCE"),
+        "ignored_project_config": config.get("_IGNORED_PROJECT_CONFIG"),
+        "ignored_project_config_keys": ignored_project_keys,
+        "ignored_endpoint_overrides": ignored_endpoint_overrides,
+        "browser_cookies": browser_cookies,
+        "external_commands": external_commands,
+        "credential_destinations": credential_destinations,
+        "local_writes": local_writes,
     }
 
 
@@ -635,7 +687,13 @@ def _finalize_items_by_source(
             # relevance. Backfill survivors that arrived without one so the
             # transcript budget lands on videos the brief actually shows
             # (#542).
-            youtube_yt.backfill_transcripts(items, topic=topic, depth=depth)
+            sc_token = (
+                config.get("SCRAPECREATORS_API_KEY")
+                if config and env.is_youtube_sc_available(config) else None
+            )
+            youtube_yt.backfill_transcripts(
+                items, topic=topic, depth=depth, token=sc_token,
+            )
         # Post-merge topic-relevance filter for Polymarket: comparison queries
         # fan out into per-entity subqueries ("Hermes", "OpenClaw") whose topic
         # is too narrow for Gamma API to filter meaningfully. Re-validating the
@@ -809,7 +867,9 @@ def _run_supplemental_searches(
 
     from_date, to_date = date_range
 
-    # Convert SourceItems to dicts for entity_extract
+    # Convert SourceItems to dicts for entity_extract. All X items (whatever
+    # backend fetched them — bird, xai, xurl, xquik) land under the single "x"
+    # slug, so this reads the whole X corpus.
     x_dicts = [
         {"author_handle": item.author or "", "text": item.body or ""}
         for item in bundle.items_by_source.get("x", [])
@@ -855,13 +915,41 @@ def _run_supplemental_searches(
     if not handles and not related_handles:
         return
 
-    # Check if X is rate-limited
-    if "x" in rate_limited_sources:
-        return
+    # Pick the X handle-search backend: the first handle-capable backend in the
+    # chain (bird or xquik). These supplemental from:/mentions lanes are
+    # complementary to the topic search, so when the topic primary can't run
+    # them (xai/xurl have no handle-lane implementation) but a capable backend
+    # is available, use it rather than skipping Phase 2. bird scrapes X GraphQL
+    # with the user's browser cookies; xquik runs the same lanes over its REST
+    # API. All items land under the single "x" slug.
+    x_slug = "x"
+    chain = env.x_backend_chain(config)
+    # Trust an explicit runtime backend as the head of the chain.
+    pinned = runtime.x_search_backend
+    if pinned:
+        chain = [pinned] + [b for b in chain if b != pinned]
+    primary = next((b for b in chain if b in ("bird", "xquik")), None)
 
-    backend = runtime.x_search_backend or env.get_x_source(config)
-    if backend != "bird":
-        return  # Handle search only works with Bird CLI
+    if primary == "bird":
+        def _from_lane(hs: list, count: int) -> list:
+            return bird_x.search_handles(hs, topic, from_date, count_per=count)
+
+        def _about_lane(hs: list, count: int) -> list:
+            return bird_x.search_mentions(hs, from_date, count_per=count)
+    elif primary == "xquik":
+        xquik_token = env.get_xquik_token(config)
+
+        def _from_lane(hs: list, count: int) -> list:
+            return xquik.search_handles(hs, topic, from_date, to_date, count_per=count, token=xquik_token)
+
+        def _about_lane(hs: list, count: int) -> list:
+            return xquik.search_mentions(hs, from_date, to_date, topic=topic, count_per=count, token=xquik_token)
+    else:
+        return  # primary X backend has no handle-lane support (xai/xurl) or none configured
+
+    # Skip if the X source is rate-limited.
+    if x_slug in rate_limited_sources:
+        return
 
     # Collect existing URLs for deduplication
     existing_urls = {
@@ -883,27 +971,27 @@ def _run_supplemental_searches(
         from_items: list = []
         about_items: list = []
         try:
-            from_items = bird_x.search_handles(handles, topic, from_date, count_per=FROM_LANE_COUNT_PER)
+            from_items = _from_lane(handles, FROM_LANE_COUNT_PER)
         except Exception as exc:
             print(f"[Pipeline] Phase 2 FROM-lane search failed: {exc}", file=sys.stderr)
-            if not bundle.items_by_source.get("x"):
-                bundle.errors_by_source["x"] = f"Phase 2 FROM-lane: {exc}"
+            if not bundle.items_by_source.get(x_slug):
+                bundle.errors_by_source[x_slug] = f"Phase 2 FROM-lane: {exc}"
         try:
-            about_items = bird_x.search_mentions(handles, from_date, count_per=MENTION_LANE_COUNT_PER)
+            about_items = _about_lane(handles, MENTION_LANE_COUNT_PER)
         except Exception as exc:
             print(f"[Pipeline] Phase 2 ABOUT-lane search failed: {exc}", file=sys.stderr)
         raw_items = from_items + about_items
 
         if raw_items:
             normalized = _normalize_score_dedupe(
-                "x", raw_items, from_date, to_date,
+                x_slug, raw_items, from_date, to_date,
                 freshness_mode=plan.freshness_mode,
                 ranking_query=ranking_query,
             )
             # Deduplicate against Phase 1 URLs
             normalized = [item for item in normalized if item.url not in existing_urls]
             if normalized:
-                bundle.add_items(primary_label, "x", normalized)
+                bundle.add_items(primary_label, x_slug, normalized)
                 # Update existing URLs for related-handle dedup
                 for item in normalized:
                     if item.url:
@@ -912,16 +1000,14 @@ def _run_supplemental_searches(
     # Search related handles with lower weight (0.3)
     if related_handles:
         try:
-            raw_items = bird_x.search_handles(
-                related_handles, topic, from_date, count_per=RELATED_HANDLE_COUNT_PER,
-            )
+            raw_items = _from_lane(related_handles, RELATED_HANDLE_COUNT_PER)
         except Exception as exc:
             print(f"[Pipeline] Phase 2 related handle search failed: {exc}", file=sys.stderr)
             raw_items = []
 
         if raw_items:
             normalized = _normalize_score_dedupe(
-                "x", raw_items, from_date, to_date,
+                x_slug, raw_items, from_date, to_date,
                 freshness_mode=plan.freshness_mode,
                 ranking_query=ranking_query,
             )
@@ -930,7 +1016,7 @@ def _run_supplemental_searches(
             if normalized:
                 # Use a separate subquery label with lower weight so RRF
                 # scores related-handle results below primary results.
-                bundle.add_items("supplemental-related", "x", normalized)
+                bundle.add_items("supplemental-related", x_slug, normalized)
                 # Register the supplemental-related label in the plan for fusion
                 if not any(sq.label == "supplemental-related" for sq in plan.subqueries):
                     plan.subqueries.append(
@@ -938,7 +1024,7 @@ def _run_supplemental_searches(
                             label="supplemental-related",
                             search_query=", ".join(related_handles),
                             ranking_query=ranking_query,
-                            sources=["x"],
+                            sources=[x_slug],
                             weight=0.3,
                         )
                     )
@@ -1047,6 +1133,33 @@ def _retry_thin_sources(
                 print(f"[Pipeline] Retry failed for {source}: {type(exc).__name__}: {exc}", file=sys.stderr)
 
 
+def _fetch_x_backend(backend, subquery, from_date, to_date, depth, config):
+    """Fetch X items from a single backend. Returns (items, error_str).
+
+    Backends are tried in priority order by the caller (env.x_backend_chain);
+    a non-empty error_str signals a hard failure (auth/payment/etc.) so the
+    caller can fail over to the next backend or surface the error honestly.
+    """
+    query = subquery.search_query
+    if backend == "bird":
+        result = bird_x.search_x(query, from_date, to_date, depth=depth)
+        items = bird_x.parse_bird_response(result, query=query)
+    elif backend == "xai":
+        model = config.get("LAST30DAYS_X_MODEL") or config.get("XAI_MODEL_PIN") or providers.XAI_DEFAULT
+        result = xai_x.search_x(config["XAI_API_KEY"], model, query, from_date, to_date, depth=depth)
+        items = xai_x.parse_x_response(result)
+    elif backend == "xurl":
+        result = xurl_x.search_x(query, depth=depth)
+        items = xurl_x.parse_x_response(result, topic=query)
+    elif backend == "xquik":
+        result = xquik.search_xquik(query, from_date, to_date, depth=depth, token=env.get_xquik_token(config))
+        items = xquik.parse_xquik_response(result)
+    else:
+        return [], f"unknown X backend: {backend}"
+    err = result.get("error") if isinstance(result, dict) else ""
+    return items, (err or "")
+
+
 def _retrieve_stream(
     *,
     topic: str,
@@ -1123,46 +1236,62 @@ def _retrieve_stream(
                 )
         return [], {}
     if source == "x":
-        backend = runtime.x_search_backend or env.get_x_source(config)
-        if backend == "bird":
-            result = bird_x.search_x(subquery.search_query, from_date, to_date, depth=depth)
-            return bird_x.parse_bird_response(result, query=subquery.search_query), {}
-        if backend == "xai":
-            model = config.get("LAST30DAYS_X_MODEL") or config.get("XAI_MODEL_PIN") or providers.XAI_DEFAULT
-            result = xai_x.search_x(
-                config["XAI_API_KEY"],
-                model,
-                subquery.search_query,
-                from_date,
-                to_date,
-                depth=depth,
-            )
-            return xai_x.parse_x_response(result), {}
-        if backend == "xurl":
-            result = xurl_x.search_x(subquery.search_query, depth=depth)
-            return xurl_x.parse_x_response(result, topic=subquery.search_query), {}
-        raise RuntimeError("No X backend is available.")
+        # One X source, an ordered chain of interchangeable backends. Try the
+        # primary; fall through to the next only if it returns nothing or errors.
+        chain = env.x_backend_chain(config)
+        # Trust an explicit runtime backend as the primary (already resolved as
+        # available), keeping the rest of the chain as failover backups.
+        pinned = runtime.x_search_backend
+        if pinned:
+            chain = [pinned] + [b for b in chain if b != pinned]
+        if not chain:
+            raise RuntimeError("No X backend is available.")
+        last_error = ""
+        for i, backend in enumerate(chain):
+            items, err = _fetch_x_backend(backend, subquery, from_date, to_date, depth, config)
+            if items:
+                if i > 0:
+                    print(f"[X] primary backend(s) returned nothing; used fallback '{backend}'", file=sys.stderr)
+                return items, {}
+            if err:
+                last_error = f"{backend}: {err}"
+                print(f"[X] backend '{backend}' failed ({err}); trying next", file=sys.stderr)
+        if last_error:
+            raise RuntimeError(f"All X backends failed — {last_error}")
+        return [], {}
     if source == "youtube":
         # Use raw_topic so expand_youtube_queries() generates diverse variants
         # from the original user topic, not the planner's narrowed search_query.
         yt_query = raw_topic or subquery.search_query
         result = None
-        # Try yt-dlp first, fall back to SC YouTube if it fails or isn't installed
+        # ScrapeCreators key (when present) is the default-on backup tier: it
+        # powers the per-video transcript fallback, the SC search fallback, and
+        # comment enrichment. None when no key, which keeps everything keyless.
+        sc_token = (
+            config.get("SCRAPECREATORS_API_KEY", "")
+            if env.is_youtube_sc_available(config) else None
+        )
+        # Try yt-dlp first; the SC transcript fallback covers per-video failures.
         if which("yt-dlp"):
             try:
-                result = youtube_yt.search_and_transcribe(yt_query, from_date, to_date, depth=depth)
+                result = youtube_yt.search_and_transcribe(
+                    yt_query, from_date, to_date, depth=depth, token=sc_token,
+                )
             except Exception:
                 result = None
-        if (result is None or not result.get("items")) and env.is_youtube_sc_available(config):
-            sc_token = config.get("SCRAPECREATORS_API_KEY", "")
-            result = youtube_yt.search_youtube_sc(yt_query, from_date, to_date, depth=depth, token=sc_token)
+        # Fall back to SC YouTube search if yt-dlp failed or isn't installed.
+        if (result is None or not result.get("items")) and sc_token:
+            result = youtube_yt.search_youtube_sc(
+                yt_query, from_date, to_date, depth=depth, token=sc_token,
+            )
         if result is None:
             result = {"items": []}
-        # Enrich top videos with comments when SC key is available
+        # Enrich top videos with comments (default-on when a key is present).
         items = youtube_yt.parse_youtube_response(result)
         if items and env.is_youtube_comments_available(config):
-            sc_token = config.get("SCRAPECREATORS_API_KEY", "")
-            youtube_yt.enrich_with_comments(items, token=sc_token)
+            youtube_yt.enrich_with_comments(
+                items, token=config.get("SCRAPECREATORS_API_KEY", ""),
+            )
         return items, {}
     if source == "tiktok":
         # Use raw_topic so expand_tiktok_queries() generates diverse variants
@@ -1220,7 +1349,12 @@ def _retrieve_stream(
         return truthsocial.parse_truthsocial_response(result), {}
     if source == "polymarket":
         result = polymarket.search_polymarket(subquery.search_query, from_date, to_date, depth=depth)
-        return polymarket.parse_polymarket_response(result, topic=subquery.search_query), {}
+        # Relevance filtering keys off the stable original research topic, not the
+        # per-subquery search_query (which narrows differently on each fanout pass
+        # and would let off-topic markets through on broad subqueries while dropping
+        # everything on narrow ones).
+        relevance_topic = raw_topic or topic or subquery.search_query
+        return polymarket.parse_polymarket_response(result, topic=relevance_topic), {}
     if source == "github":
         # Resolve once at the pipeline boundary so search and enrich
         # share the result; otherwise each call would re-run the env
@@ -1251,13 +1385,6 @@ def _retrieve_stream(
         ), {}
     if source == "perplexity":
         return perplexity.search(subquery.search_query, date_range, config, deep=config.get("_deep_research", False))
-    if source == "xquik":
-        result = xquik.search_xquik(
-            subquery.search_query, from_date, to_date,
-            depth=depth,
-            token=env.get_xquik_token(config),
-        )
-        return xquik.parse_xquik_response(result), {}
     raise RuntimeError(f"Unsupported source: {source}")
 
 

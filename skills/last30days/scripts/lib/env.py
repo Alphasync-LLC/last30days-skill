@@ -42,7 +42,7 @@ KEYCHAIN_KEYS = (
     "GOOGLE_GENAI_API_KEY", "SCRAPECREATORS_API_KEY", "APIFY_API_TOKEN",
     "AUTH_TOKEN", "CT0", "BSKY_HANDLE", "BSKY_APP_PASSWORD",
     "TRUTHSOCIAL_TOKEN", "BRAVE_API_KEY", "EXA_API_KEY", "SERPER_API_KEY",
-    "OPENROUTER_API_KEY", "PARALLEL_API_KEY", "XQUIK_API_KEY",
+    "OPENROUTER_API_KEY", "PERPLEXITY_API_KEY", "PARALLEL_API_KEY", "XQUIK_API_KEY",
     "XIAOHONGSHU_API_BASE",
 )
 
@@ -75,6 +75,38 @@ class OpenAIAuth:
     status: AuthStatus
     account_id: str | None
     codex_auth_file: str
+
+
+BrowserCookieMode = Literal["off", "read", "plan_only"]
+
+
+@dataclass(frozen=True)
+class ConfigLoadPolicy:
+    """Local-read gates for configuration loading.
+
+    Bare library calls use the safe default: no browser-cookie extraction and no
+    project-scoped config. CLI entry points can opt into narrower behavior after
+    parsing command intent.
+    """
+
+    browser_cookies: BrowserCookieMode = "off"
+    allow_project_config: bool = False
+    inspect_ignored_project_config: bool = False
+
+
+def _truthy(value: Any) -> bool:
+    if value is None:
+        return False
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _project_config_trusted(policy: ConfigLoadPolicy, file_env: dict[str, Any]) -> bool:
+    if policy.allow_project_config:
+        return True
+    process_value = os.environ.get("LAST30DAYS_TRUST_PROJECT_CONFIG")
+    if process_value is not None:
+        return _truthy(process_value)
+    return _truthy(file_env.get("LAST30DAYS_TRUST_PROJECT_CONFIG"))
 
 
 def _check_file_permissions(path: Path) -> None:
@@ -315,34 +347,46 @@ def _find_project_env() -> Path | None:
     """Find per-project .env by walking up from cwd.
 
     Searches for .claude/last30days.env in each parent directory,
-    stopping at the user's home directory or filesystem root.
+    stopping at the git root, user's home directory, or filesystem root.
     """
     cwd = Path.cwd()
     for parent in [cwd, *cwd.parents]:
         candidate = parent / '.claude' / 'last30days.env'
         if candidate.exists():
             return candidate
+        if (parent / ".git").exists():
+            break
         # Stop at filesystem root or home
         if parent == Path.home() or parent == parent.parent:
             break
     return None
 
 
-def get_config() -> dict[str, Any]:
+def get_config(policy: ConfigLoadPolicy | None = None) -> dict[str, Any]:
     """Load configuration from multiple sources.
 
     Priority (highest wins):
       1. Environment variables (os.environ)
-      2. .claude/last30days.env (per-project config)
+      2. Trusted .claude/last30days.env (per-project config)
       3. ~/.config/last30days/.env (global config)
       4. macOS Keychain items prefixed ``last30days-`` (Darwin only)
     """
+    policy = policy or ConfigLoadPolicy()
     # Load from global config file
     file_env = load_env_file(CONFIG_FILE) if CONFIG_FILE else {}
 
-    # Load from per-project config (overrides global)
-    project_env_path = _find_project_env()
+    # Load per-project config only when trust comes from process env, global
+    # user config, or an explicit policy. A project file cannot grant trust to
+    # itself because it is not parsed until after this decision.
+    project_config_trusted = _project_config_trusted(policy, file_env)
+    project_env_path = _find_project_env() if project_config_trusted else None
     project_env = load_env_file(project_env_path) if project_env_path else {}
+    ignored_project_env_path = None
+    ignored_project_keys: list[str] = []
+    if not project_config_trusted and policy.inspect_ignored_project_config:
+        ignored_project_env_path = _find_project_env()
+        if ignored_project_env_path:
+            ignored_project_keys = sorted(load_env_file(ignored_project_env_path).keys())
 
     # Merge file sources: project > global
     merged_env = {**file_env, **project_env}
@@ -408,6 +452,18 @@ def get_config() -> dict[str, Any]:
         ('EXA_API_KEY', None),
         ('SERPER_API_KEY', None),
         ('OPENROUTER_API_KEY', None),
+        ('PERPLEXITY_API_KEY', None),
+        ('LAST30DAYS_PERPLEXITY_MODE', 'sonar'),
+        ('LAST30DAYS_PERPLEXITY_MODEL', None),
+        ('LAST30DAYS_PERPLEXITY_MAX_RESULTS', None),
+        ('LAST30DAYS_PERPLEXITY_SEARCH_CONTEXT_SIZE', None),
+        ('LAST30DAYS_PERPLEXITY_SEARCH_MODE', None),
+        ('LAST30DAYS_PERPLEXITY_DOMAIN_FILTER', None),
+        ('LAST30DAYS_PERPLEXITY_LANGUAGE_FILTER', None),
+        ('LAST30DAYS_PERPLEXITY_COUNTRY', None),
+        ('LAST30DAYS_PERPLEXITY_RECENCY_FILTER', None),
+        ('LAST30DAYS_PERPLEXITY_REASONING_EFFORT', None),
+        ('LAST30DAYS_PERPLEXITY_DEEP_TIMEOUT_SECONDS', '600'),
         ('PARALLEL_API_KEY', None),
         ('XQUIK_API_KEY', None),
         # Host-native search signal: set by the SKILL.md agent-host path when the
@@ -417,6 +473,7 @@ def get_config() -> dict[str, Any]:
         # Optional SearXNG instance for the keyless-search fallback rung.
         ('LAST30DAYS_SEARXNG_URL', None),
         ('FROM_BROWSER', None),
+        ('LAST30DAYS_TRUST_PROJECT_CONFIG', None),
         ('SETUP_COMPLETE', None),
         ('INCLUDE_SOURCES', ''),
         ('EXCLUDE_SOURCES', ''),
@@ -464,13 +521,18 @@ def get_config() -> dict[str, Any]:
         config['_CONFIG_SOURCE'] = 'pass'
     else:
         config['_CONFIG_SOURCE'] = 'env_only'
+    if ignored_project_env_path:
+        config['_IGNORED_PROJECT_CONFIG'] = str(ignored_project_env_path)
+        config['_IGNORED_PROJECT_CONFIG_KEYS'] = ignored_project_keys
+    config['_BROWSER_COOKIE_MODE'] = policy.browser_cookies
+    config['_BROWSER_COOKIE_BROWSERS'] = cookie_extraction_browsers(config)
 
-    # Extract browser credentials if configured
-    browser_creds = extract_browser_credentials(config)
-    for key, value in browser_creds.items():
-        if not config.get(key):
-            config[key] = value
-            config[f"_{key}_SOURCE"] = "browser"
+    if policy.browser_cookies == "read":
+        browser_creds = extract_browser_credentials(config)
+        for key, value in browser_creds.items():
+            if not config.get(key):
+                config[key] = value
+                config[f"_{key}_SOURCE"] = "browser"
 
     return config
 
@@ -496,16 +558,17 @@ COOKIE_DOMAINS: dict[str, dict[str, Any]] = {
 def cookie_extraction_browsers(config: dict[str, Any]) -> list[str]:
     """Browsers to try for cookie extraction, honoring FROM_BROWSER.
 
-    Default (FROM_BROWSER unset): Firefox and Safari only. These read local
-    files silently with no system dialogs. The Chromium family (Chrome, Brave,
-    Edge, Vivaldi, Opera, Arc, Chromium) is skipped because reading their
-    cookies on macOS requires the browser's Safe Storage Keychain key, which
-    triggers a system password prompt that cannot be reliably suppressed. On
-    Windows only Firefox cookie extraction is supported; Chrome and Edge use
-    DPAPI-encrypted cookie stores that are not yet supported.
+    Default (FROM_BROWSER unset): no browser-cookie reads. The Chromium family
+    (Chrome, Brave, Edge, Vivaldi, Opera, Arc, Chromium) is available only when
+    explicitly selected because reading their cookies on macOS requires the
+    browser's Safe Storage Keychain key, which triggers a system password prompt
+    that cannot be reliably suppressed. On Windows only Firefox cookie
+    extraction is supported; Chrome and Edge use DPAPI-encrypted cookie stores
+    that are not yet supported.
 
     - ``FROM_BROWSER=<name>`` - a single browser (e.g. ``firefox``, ``brave``,
       ``edge``, ``arc``).
+    - ``FROM_BROWSER=firefox,safari`` - a comma-separated explicit browser list.
     - ``FROM_BROWSER=auto`` - also try every Chromium browser (user accepts the
       Keychain dialog when needed).
     - ``FROM_BROWSER=off`` - returns [] (extraction disabled).
@@ -516,14 +579,37 @@ def cookie_extraction_browsers(config: dict[str, Any]) -> list[str]:
     """
     silent_browsers = ["firefox", "safari"]
     chromium_browsers = ["chrome", "brave", "edge", "vivaldi", "opera", "arc", "chromium"]
+    known_browsers = silent_browsers + chromium_browsers
     from_browser = (config.get("FROM_BROWSER") or "").strip().lower()
+    if not from_browser:
+        return []
     if from_browser == "off":
         return []
-    if from_browser in silent_browsers or from_browser in chromium_browsers:
-        return [from_browser]
     if from_browser == "auto":
         return silent_browsers + chromium_browsers
-    return list(silent_browsers)
+    if "," in from_browser:
+        requested = [b.strip() for b in from_browser.split(",") if b.strip()]
+        resolved = [b for b in requested if b in known_browsers]
+        unknown = [b for b in requested if b not in known_browsers]
+        if unknown:
+            sys.stderr.write(
+                "[last30days] WARNING: FROM_BROWSER ignored unrecognized browser(s): "
+                f"{', '.join(unknown)} (known: {', '.join(known_browsers)})\n"
+            )
+            sys.stderr.flush()
+        return resolved
+    if from_browser in known_browsers:
+        return [from_browser]
+    # Non-empty, not off/auto, not a known browser, not a list: unrecognized.
+    # Warn rather than fail silently so a typo (FROM_BROWSER=chrme) is visible
+    # instead of looking like "no cookies found".
+    sys.stderr.write(
+        f"[last30days] WARNING: FROM_BROWSER='{from_browser}' is not a recognized "
+        f"browser; no cookies will be read (known: {', '.join(known_browsers)}, "
+        "or 'auto'/'off')\n"
+    )
+    sys.stderr.flush()
+    return []
 
 
 
@@ -572,9 +658,11 @@ def get_x_source_with_method(config: dict[str, Any]) -> tuple[str | None, str]:
     return None, "none"
 
 
-def config_exists() -> bool:
+def config_exists(policy: ConfigLoadPolicy | None = None) -> bool:
     """Check if any configuration source exists."""
-    if _find_project_env():
+    policy = policy or ConfigLoadPolicy()
+    file_env = load_env_file(CONFIG_FILE) if CONFIG_FILE and CONFIG_FILE.exists() else {}
+    if _project_config_trusted(policy, file_env) and _find_project_env():
         return True
     if CONFIG_FILE:
         return CONFIG_FILE.exists()
@@ -591,48 +679,63 @@ def get_reddit_source(config: dict[str, Any]) -> str | None:
     return None
 
 
-def get_x_source(config: dict[str, Any]) -> str | None:
-    """Determine the best available explicit X/Twitter source.
+# Default X backend priority. The first available backend is the primary X
+# source; the rest are ordered failover backups, tried only if the one before
+# returns nothing or errors. There is one X source ("x"); these are its
+# interchangeable backends, never run in parallel.
+#   xai   — xAI/Grok live search (XAI_API_KEY)
+#   bird  — X GraphQL scrape via the user's browser cookies (AUTH_TOKEN/CT0)
+#   xurl  — official X API v2 (xurl CLI, OAuth2)
+#   xquik — key-based REST X search (XQUIK_API_KEY); keyless of browser cookies
+_X_BACKEND_ORDER = ("xai", "bird", "xurl", "xquik")
 
-    Priority: explicit backend pin, then xAI, then Bird with explicit cookies.
 
-    Browser-cookie probing is intentionally not used here. Automatic Keychain
-    access causes popups during normal pipeline runs. Bird is only considered
-    available when AUTH_TOKEN and CT0 are present explicitly.
+def _x_backend_available(backend: str, config: dict[str, Any], has_bird_creds: bool) -> bool:
+    if backend == 'xai':
+        return bool(config.get('XAI_API_KEY'))
+    if backend == 'bird':
+        from . import bird_x
+        return has_bird_creds and bird_x.is_bird_installed()
+    if backend == 'xurl':
+        from . import xurl_x
+        return xurl_x.is_available()
+    if backend == 'xquik':
+        return is_xquik_available(config)
+    return False
 
-    Args:
-        config: Configuration dict from get_config()
 
-    Returns:
-        'bird' if Bird is installed and explicit cookies are configured,
-        'xai' if XAI_API_KEY is configured,
-        'xurl' if xurl CLI is installed and authenticated,
-        None if no X source available.
+def x_backend_chain(config: dict[str, Any]) -> list[str]:
+    """Ordered list of available X backends.
+
+    ``chain[0]`` is the default X source; the remaining entries are failover
+    backups, used only when the one before yields no items or errors. There is
+    exactly one X source — these are its backends, never fetched in parallel.
+
+    A ``LAST30DAYS_X_BACKEND`` pin forces a single backend (no failover): the
+    user explicitly chose it. Browser-cookie probing is intentionally avoided
+    (automatic Keychain access causes popups); bird counts as available only
+    when AUTH_TOKEN and CT0 are present explicitly.
     """
-    # Import here to avoid circular dependency
     from . import bird_x
-
-    preferred = (config.get('LAST30DAYS_X_BACKEND') or '').lower()
     has_bird_creds = bool(config.get('AUTH_TOKEN') and config.get('CT0'))
     if has_bird_creds:
         bird_x.set_credentials(config.get('AUTH_TOKEN'), config.get('CT0'))
 
-    if preferred == 'xai':
-        return 'xai' if config.get('XAI_API_KEY') else None
-    if preferred == 'bird':
-        return 'bird' if has_bird_creds and bird_x.is_bird_installed() else None
+    preferred = (config.get('LAST30DAYS_X_BACKEND') or '').lower()
+    if preferred in _X_BACKEND_ORDER:
+        return [preferred] if _x_backend_available(preferred, config, has_bird_creds) else []
 
-    if config.get('XAI_API_KEY'):
-        return 'xai'
-    if has_bird_creds and bird_x.is_bird_installed():
-        return 'bird'
+    return [b for b in _X_BACKEND_ORDER if _x_backend_available(b, config, has_bird_creds)]
 
-    # Fall back to xurl CLI (official X API v2, OAuth2, free developer app)
-    from . import xurl_x
-    if xurl_x.is_available():
-        return 'xurl'
 
-    return None
+def get_x_source(config: dict[str, Any]) -> str | None:
+    """The default (primary) X backend, or None if no X source is available.
+
+    Thin wrapper over ``x_backend_chain`` returning the first/primary backend;
+    callers that want failover should use ``x_backend_chain`` directly.
+    """
+    chain = x_backend_chain(config)
+    return chain[0] if chain else None
 
 
 def is_ytdlp_available() -> bool:
@@ -644,12 +747,17 @@ def is_ytdlp_available() -> bool:
 def is_youtube_comments_available(config: dict[str, Any]) -> bool:
     """Check if YouTube comment enrichment is available.
 
-    Requires SCRAPECREATORS_API_KEY AND youtube_comments in INCLUDE_SOURCES.
+    Default-on when SCRAPECREATORS_API_KEY is set — the same key-only backup
+    tier as the YouTube transcript fallback (``is_youtube_sc_available``). Cost
+    is bounded by ``enrich_with_comments(max_videos=3)`` (~3 credits per run).
+    Suppress via ``EXCLUDE_SOURCES=youtube_comments``.
+
+    Note: TikTok/Instagram comments remain explicit ``INCLUDE_SOURCES`` opt-ins
+    (see ``is_tiktok_comments_available``); only YouTube comments are default-on.
     """
     if not config.get('SCRAPECREATORS_API_KEY'):
         return False
-    include = _parse_include_sources(config)
-    return 'youtube_comments' in include
+    return 'youtube_comments' not in _parse_exclude_sources(config)
 
 
 def is_tiktok_comments_available(config: dict[str, Any]) -> bool:
@@ -763,6 +871,12 @@ def _parse_include_sources(config: dict[str, Any]) -> set[str]:
     return {s.strip().lower() for s in raw.split(',') if s.strip()}
 
 
+def _parse_exclude_sources(config: dict[str, Any]) -> set[str]:
+    """Parse EXCLUDE_SOURCES config value into a set of lowercase source names."""
+    raw = config.get('EXCLUDE_SOURCES') or ''
+    return {s.strip().lower() for s in raw.split(',') if s.strip()}
+
+
 def is_threads_available(config: dict[str, Any]) -> bool:
     """Check if Threads source is available.
 
@@ -867,15 +981,35 @@ def get_x_source_status(config: dict[str, Any], probe: bool = False) -> dict[str
             bird_status["authenticated"] = False
             bird_status["username"] = "probe failed (no working X auth)"
 
-    # Determine active source
+    # Xquik: the key-based X source used when bird's cookie auth isn't available.
+    # Probe so --diagnose reports the true state — funded, or configured-but-
+    # unpaid (402) — instead of false-green on mere key presence.
+    xquik_available = is_xquik_available(config)
+    xquik_working: bool | None = None
+    xquik_status = ""
+    if xquik_available:
+        if probe:
+            from . import xquik
+            xquik_working = xquik.probe_works(get_xquik_token(config))
+            xquik_status = xquik.probe_reason()
+        else:
+            xquik_status = "configured (not probed)"
+
+    # Determine active source. bird (browser cookies) and xAI win when present;
+    # when neither is available, xquik is the active X source. A probe that
+    # clearly failed (False) means xquik is not actually usable.
     if bird_status["authenticated"]:
         source = 'bird'
     elif xai_available:
         source = 'xai'
     else:
-        # Fall back to xurl CLI
         from . import xurl_x as _xurl_check
-        source = 'xurl' if _xurl_check.is_available() else None
+        if _xurl_check.is_available():
+            source = 'xurl'
+        elif xquik_available and xquik_working is not False:
+            source = 'xquik'
+        else:
+            source = None
 
     from . import xurl_x as _xurl_x
     return {
@@ -885,6 +1019,9 @@ def get_x_source_status(config: dict[str, Any], probe: bool = False) -> dict[str
         "bird_username": bird_status["username"],
         "xai_available": xai_available,
         "xurl_available": _xurl_x.is_available(),
+        "xquik_available": xquik_available,
+        "xquik_working": xquik_working,
+        "xquik_status": xquik_status,
         "can_install_bird": bird_status["can_install"],
     }
 

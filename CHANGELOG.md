@@ -7,6 +7,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- MCP Go tests (`mcp/`) now run in CI on every push/PR alongside the Python test suite, so MCP server regressions are caught before merge ([#621](https://github.com/mvanhorn/last30days-skill/issues/621))
+
+## [3.8.1] - 2026-06-22
+
+### Added
+- **Restored the v3.0.0 first-run NUX wizard (Claude Code Modal Flow).** Step 0 now restores the original guided, `AskUserQuestion`-driven onboarding that eroded over time: a welcome message, an Auto/Manual/Skip setup modal, a cookie-consent modal, the ScrapeCreators signup offer, a TikTok/Instagram `INCLUDE_SOURCES` opt-in, and a first-topic picker. It is gated to hosts with modals; hosts without (OpenClaw, Codex, Cursor, Gemini CLI) get the equivalent **Non-Modal Prose Flow**. Digg is threaded into the install messaging alongside yt-dlp everywhere it appears, the ScrapeCreators credit count is `10,000 free calls`, and the flow is locked against re-erosion by `tests/test_onboarding_contract.py`. Builds on the consent-driven foundation from #659/#660. Original wizard captured at `docs/reference/old-nux-wizard-v3.0.0.md`.
+- **Consent-driven first-run onboarding.** Step 0 now drives an in-chat consent flow instead of a silent `setup` run: the model asks before reading browser cookies (decline runs with `FROM_BROWSER=off` — still installs yt-dlp + Digg), surfaces the macOS Full Disk Access fix when a cookie read is permission-denied, and offers the ScrapeCreators GitHub signup on every first run. A successful `setup --github` now **persists `SCRAPECREATORS_API_KEY` automatically** (`setup_wizard.write_api_key`, 0o600) and masks the key in stdout so the secret never lands in the host model's captured output. Follows the first-run gate fix (#659).
+
+### Fixed
+- **First-run setup no longer runs silently.** The prior Step 0 told the model to run `setup` and "follow the wizard's prompts end-to-end", but the wizard has no prompts — so onboarding extracted cookies, installed tools, and wrote `SETUP_COMPLETE` with zero interaction and never offered the ScrapeCreators signup. Reproduced 2026-06-22 (Fredy Montero, fresh macOS).
+
+## [3.8.0] - 2026-06-21
+
+### Added
+
+- **Single X source with backend failover.** X is now one source backed by an ordered chain of interchangeable backends (xai, bird, xurl, xquik) with runtime failover, rather than separate sources. The key-based xquik backend reaches parity with bird, gaining the X-quality ranking and FROM/ABOUT handle lanes, so hosts that cannot supply browser cookies (OpenClaw, CI/cron, headless harnesses) get real X coverage from an xquik key alone. Handle lanes run via the first handle-capable backend in the chain even when a non-capable backend (xai/xurl) is primary. (#622)
+
+## [3.7.1] - 2026-06-21
+
+### Fixed
+
+- GitHub repo stars are no longer mislabeled as "reactions" in the report footer. Repo cards use a distinct `stars` engagement key, velocity cards use `merged_prs`, and genuine issue/PR reaction counts keep their own `reactions` key. (#645, closes #642)
+- Hacker News returned zero stories on every run: the Algolia query sent `points>2`, which the HN index no longer accepts as a filterable attribute, so every request 400'd. Dropped the server-side `points` filter; low-engagement demotion still happens at parse time. (#639)
+- Polymarket surfaced off-topic markets and rendered a mangled footer. The relevance filter was fed the per-subquery string instead of the stable topic, and market labels were truncated mid-article into fragments like "an Anthropic Claude model score at: an 19%". Now filters on the stable topic and cleans the labels. (#640)
+
+## [3.7.0] - 2026-06-20
+
+### Added
+
+- **Direct Perplexity API support.** When `PERPLEXITY_API_KEY` is set it is preferred over OpenRouter for the Perplexity source, unlocking first-party Search API results and async Deep Research. Adds `LAST30DAYS_PERPLEXITY_MODE=sonar|search|both` plus model, search-context, domain/language/country, recency, and reasoning-effort knobs. OpenRouter stays the Sonar compatibility fallback when no direct key is set. Async Deep Research preserves request id, status, idempotency key, poll count, lifecycle timestamps, and failure metadata in raw artifacts. (#629, by @sk-holmes)
+
+### Changed
+
+- `check-config.sh` now parses env files in pure bash (no `sed` / `tr`), which also fixes the YouTube-availability hint breaking in minimal environments that lack those tools. (#629)
+
+## [3.6.1] - 2026-06-20
+
+### Added
+
+- **ScrapeCreators transcript fallback.** When `SCRAPECREATORS_API_KEY` is set, YouTube transcripts fall back to the ScrapeCreators transcript endpoint after the keyless yt-dlp cascade fails (fetched server-side, so no 429 / cookies / PO tokens). yt-dlp stays primary and a credit is only spent on a genuine failure, never on success and never on a video proven to have no captions. With a key, yt-dlp also fails over fast (one short-timeout attempt) so a 429 hands off to ScrapeCreators in roughly 17s instead of roughly 90s. (#637, idea from #595)
+- **YouTube comments default-on.** Comment enrichment now activates whenever a ScrapeCreators key is present (bounded to the top ~3 videos by engagement, ~3 credits per run) instead of requiring `INCLUDE_SOURCES=youtube_comments`. Suppress with `EXCLUDE_SOURCES=youtube_comments`. TikTok/Instagram comments remain `INCLUDE_SOURCES` opt-ins. (#637)
+
+### Fixed
+
+- **Salvage partial YouTube transcripts on non-zero yt-dlp exit.** With the default `en,es,pt` languages an English video wrote `en.vtt` then 429'd on `es`/`pt`, and the already-written transcript was discarded and retried back into the rate limit. Any VTT on disk is now read before the failure is classified, which fixes the dominant `0/N transcripts` case. (#636)
+- **Windows transcript crash on subprocess timeout.** Guarded the SIGKILL escalation path in `run_with_timeout` against `os.killpg` / `os.getpgid` raising `AttributeError` on Windows (they are POSIX-only), mirroring the primary path's guard. (#638, reported in #588)
+
 ## [3.6.0] - 2026-06-18
 
 ### Added
@@ -18,6 +67,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - The X FROM lane (the subject's own timeline) now pulls up to 8 posts per handle (was 3); the about/related lanes stay modest.
+
+### Fixed
+
+- Secrets `.env` and its parent config directory are now auto-tightened to `0o600`/`0o700` after creation, and `check-config.sh`'s `check_perms` now auto-fixes loose permissions with `chmod 600` instead of warning only ([#573](https://github.com/mvanhorn/last30days-skill/issues/573))
 
 ## [3.5.0] - 2026-06-18
 

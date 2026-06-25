@@ -7,6 +7,13 @@ set -euo pipefail
 
 PROJECT_ENV=".claude/last30days.env"
 GLOBAL_ENV="$HOME/.config/last30days/.env"
+if [[ "${LAST30DAYS_CONFIG_DIR+x}" == "x" ]]; then
+  if [[ -n "$LAST30DAYS_CONFIG_DIR" ]]; then
+    GLOBAL_ENV="$LAST30DAYS_CONFIG_DIR/.env"
+  else
+    GLOBAL_ENV=""
+  fi
+fi
 
 # Ensure LAST30DAYS_MEMORY_DIR exists for HTML-brief / raw-markdown saves.
 # SKILL.md and the engine default this via the same env-var fallback. Fresh
@@ -29,9 +36,27 @@ check_perms() {
   # every Linux session start and printed a false WARNING.
   perms=$(stat -c '%a' "$file" 2>/dev/null || stat -f '%Lp' "$file" 2>/dev/null || echo "")
   if [[ -n "$perms" && "$perms" != "600" && "$perms" != "400" ]]; then
-    echo "/last30days: WARNING — $file has permissions $perms (should be 600)."
-    echo "  Fix: chmod 600 $file"
+    chmod 600 "$file" && echo "/last30days: WARNING — $file had permissions $perms — auto-fixed with chmod 600" || echo "/last30days: WARNING — $file has permissions $perms (should be 600). Fix: chmod 600 $file"
   fi
+}
+
+trim_ws() {
+  local s="$1"
+  s="${s#"${s%%[![:space:]]*}"}"
+  s="${s%"${s##*[![:space:]]}"}"
+  printf '%s' "$s"
+}
+
+strip_outer_quotes() {
+  local s="$1"
+  if [[ ${#s} -ge 2 ]]; then
+    if [[ "${s:0:1}" == '"' && "${s: -1}" == '"' ]]; then
+      s="${s:1:${#s}-2}"
+    elif [[ "${s:0:1}" == "'" && "${s: -1}" == "'" ]]; then
+      s="${s:1:${#s}-2}"
+    fi
+  fi
+  printf '%s' "$s"
 }
 
 # Load env file into variables for inspection (without exporting)
@@ -42,8 +67,8 @@ load_env_vars() {
       # Skip comments, empty lines
       [[ "$key" =~ ^[[:space:]]*# ]] && continue
       [[ -z "$key" ]] && continue
-      key=$(echo "$key" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-      value=$(echo "$value" | sed -e 's/^[[:space:]]*//;s/[[:space:]]*$//' -e 's/^["'\''"]//;s/["'\''"]$//')
+      key="$(trim_ws "$key")"
+      value="$(strip_outer_quotes "$(trim_ws "$value")")"
       # Strip inline comments (# preceded by whitespace) to prevent
       # command substitution in backtick-containing comments
       value="${value%%[[:space:]]#*}"
@@ -81,7 +106,7 @@ load_keychain_presence() {
   esac
   command -v security >/dev/null 2>&1 || return 0
 
-  local user key current
+  local user key env_var current
   user="${USER:-}"
   if [[ -z "$user" ]]; then
     user="$(id -un 2>/dev/null || true)"
@@ -89,7 +114,11 @@ load_keychain_presence() {
   [[ -n "$user" ]] || return 0
 
   for key in SETUP_COMPLETE OPENAI_API_KEY SCRAPECREATORS_API_KEY AUTH_TOKEN CT0 XAI_API_KEY BSKY_HANDLE EXA_API_KEY; do
-    eval "current=\"\${ENV_${key}:-\${${key}:-}}\""
+    env_var="ENV_${key}"
+    current="${!env_var:-}"
+    if [[ -z "$current" ]]; then
+      current="${!key:-}"
+    fi
     [[ -n "$current" ]] && continue
     if security find-generic-password -a "$user" -s "last30days-${key}" >/dev/null 2>&1; then
       printf -v "ENV_${key}" '%s' "keychain"
@@ -204,16 +233,15 @@ if [[ -n "$HAS_BSKY" ]]; then
 fi
 if [[ -n "$HAS_SCRAPECREATORS" ]]; then
   # Start with Reddit comments + TikTok + Instagram, subtract any in EXCLUDE_SOURCES.
-  # Normalise EXCLUDED (lowercase + collapse whitespace around commas + strip outer
-  # whitespace) so the matching mirrors pipeline.py's .strip().lower() parsing.
+  # Normalise EXCLUDED by removing whitespace; case-insensitive matches below
+  # mirror pipeline.py's .strip().lower() parsing without requiring sed/tr.
   SC_ADD=3
   EXCLUDED="${ENV_EXCLUDE_SOURCES:-${EXCLUDE_SOURCES:-}}"
-  EXCLUDED_NORM=$(printf '%s' "$EXCLUDED" | tr '[:upper:]' '[:lower:]' \
-    | sed -E 's/[[:space:]]*,[[:space:]]*/,/g; s/^[[:space:]]+//; s/[[:space:]]+$//')
-  if [[ ",$EXCLUDED_NORM," == *",tiktok,"* ]]; then
+  EXCLUDED_NORM="${EXCLUDED//[[:space:]]/}"
+  if [[ ",$EXCLUDED_NORM," == *",[Tt][Ii][Kk][Tt][Oo][Kk],"* ]]; then
     SC_ADD=$((SC_ADD - 1))
   fi
-  if [[ ",$EXCLUDED_NORM," == *",instagram,"* ]]; then
+  if [[ ",$EXCLUDED_NORM," == *",[Ii][Nn][Ss][Tt][Aa][Gg][Rr][Aa][Mm],"* ]]; then
     SC_ADD=$((SC_ADD - 1))
   fi
   SOURCE_COUNT=$((SOURCE_COUNT + SC_ADD))
