@@ -162,10 +162,15 @@ def available_sources(config: dict[str, Any], requested_sources: list[str] | Non
     return available
 
 
-def diagnose(config: dict[str, Any], requested_sources: list[str] | None = None) -> dict[str, Any]:
+def diagnose(
+    config: dict[str, Any],
+    requested_sources: list[str] | None = None,
+    *,
+    safe: bool = False,
+) -> dict[str, Any]:
     requested_sources = normalize_requested_sources(requested_sources)
     google_key = _google_key(config)
-    x_status = env.get_x_source_status(config, probe=True)
+    x_status = env.get_x_source_status(config, probe=not safe)
     native_web_backend = None
     if config.get("BRAVE_API_KEY"):
         native_web_backend = "brave"
@@ -185,6 +190,34 @@ def diagnose(config: dict[str, Any], requested_sources: list[str] | None = None)
     reasoning_provider_available = any(
         providers_status[name] for name in ("google", "openai", "xai", "openrouter")
     )
+    external_commands = {
+        "yt-dlp": bool(which("yt-dlp")),
+        "digg-pp-cli": bool(which("digg-pp-cli")),
+        "gh": bool(which("gh")),
+    }
+    credential_destinations = {
+        "global_env": str(env.CONFIG_FILE) if env.CONFIG_FILE else None,
+    }
+    browser_cookies = {
+        "mode": config.get("_BROWSER_COOKIE_MODE", "off"),
+        "browsers": list(config.get("_BROWSER_COOKIE_BROWSERS") or []),
+        "reads_values": False if safe else config.get("_BROWSER_COOKIE_MODE") == "read",
+    }
+    ignored_project_keys = list(config.get("_IGNORED_PROJECT_CONFIG_KEYS") or [])
+    endpoint_override_keys = {
+        "BSKY_SEARCH_HOST",
+        "LAST30DAYS_SEARXNG_URL",
+        "LAST30DAYS_YOUTUBE_SSH_HOST",
+        "OPENAI_BASE_URL",
+        "XAI_BASE_URL",
+        "XIAOHONGSHU_API_BASE",
+    }
+    ignored_endpoint_overrides = [
+        key for key in ignored_project_keys if key in endpoint_override_keys
+    ]
+    local_writes: list[dict[str, str]] = []
+    if config.get("LAST30DAYS_MEMORY_DIR"):
+        local_writes.append({"kind": "report", "path": str(config.get("LAST30DAYS_MEMORY_DIR"))})
     return {
         "providers": providers_status,
         "local_mode": not reasoning_provider_available,
@@ -201,6 +234,15 @@ def diagnose(config: dict[str, Any], requested_sources: list[str] | None = None)
         "has_scrapecreators": bool(config.get("SCRAPECREATORS_API_KEY")),
         "has_github": bool(config.get("GITHUB_TOKEN") or which("gh")),
         "available_sources": available_sources(config, requested_sources),
+        "safe": safe,
+        "config_source": config.get("_CONFIG_SOURCE"),
+        "ignored_project_config": config.get("_IGNORED_PROJECT_CONFIG"),
+        "ignored_project_config_keys": ignored_project_keys,
+        "ignored_endpoint_overrides": ignored_endpoint_overrides,
+        "browser_cookies": browser_cookies,
+        "external_commands": external_commands,
+        "credential_destinations": credential_destinations,
+        "local_writes": local_writes,
     }
 
 
@@ -1192,6 +1234,10 @@ def _retrieve_stream(
                 )
                 if public_results:
                     return public_results, {}
+                sys.stderr.write(
+                    "[Reddit] Public fallback returned no items after "
+                    "ScrapeCreators primary miss\n"
+                )
             except Exception as exc:
                 sys.stderr.write(
                     f"[Reddit] Public fallback also failed "

@@ -2,9 +2,10 @@ import io
 import json
 import os
 import re
+import shutil
+import stat
 import subprocess
 import sys
-import shutil
 import tempfile
 import unittest
 from contextlib import redirect_stderr
@@ -265,6 +266,35 @@ class TestSkillMdFirstRunReference(unittest.TestCase):
         self.assertEqual(0, rc)
         mock_setup.assert_called_once()
         mock_write.assert_called_once()
+
+
+class TestCheckPermsAutoFix(unittest.TestCase):
+    """check_perms should auto-fix loose .env permissions instead of warning only."""
+
+    def test_loose_env_is_tightened_by_check_perms(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp) / ".config" / "last30days"
+            config_dir.mkdir(parents=True)
+            env_file = config_dir / ".env"
+            env_file.write_text("SETUP_COMPLETE=true\n")
+            os.chmod(env_file, 0o644)
+
+            env = os.environ.copy()
+            env["HOME"] = str(Path(tmp))
+            env["LAST30DAYS_CONFIG_DIR"] = str(config_dir)
+
+            result = subprocess.run(
+                ["bash", "hooks/scripts/check-config.sh"],
+                cwd=REPO_ROOT,
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("auto-fixed", result.stdout.lower())
+            self.assertEqual(stat.S_IMODE(os.stat(env_file).st_mode), 0o600)
 
 
 if __name__ == "__main__":
