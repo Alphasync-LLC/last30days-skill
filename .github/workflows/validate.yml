@@ -26,7 +26,7 @@ jobs:
         run: uv python install 3.12
 
       - name: Run test suite
-        run: uv run pytest
+        run: uv run pytest --cov --cov-report=term-missing
 
   mcp-tests:
     runs-on: ubuntu-latest
