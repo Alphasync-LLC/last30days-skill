@@ -354,8 +354,8 @@ class TestEnrichArticles(unittest.TestCase):
             # Bounded: exactly one profile call.
             self.assertEqual(1, mock_request.call_count)
             # And it fetched the matching author's profile, not the first author.
-            called_url = mock_request.call_args[0][1]
-            self.assertIn("mattvanhorn", called_url)
+            called_profile = mock_request.call_args.kwargs["params"]["url"]
+            self.assertIn("mattvanhorn", called_profile)
 
     def test_keyword_topic_makes_no_profile_call(self):
         with mock.patch("lib.linkedin.http.request") as mock_request:

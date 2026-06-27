@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import re
 from typing import Any, Dict, List
-from urllib.parse import urlencode
 
 from . import http, log
 
@@ -56,15 +55,13 @@ def search_linkedin(
 
     _log(f"Searching for '{topic}' (date_posted={date_posted})")
 
-    params: dict[str, str] = {"query": topic, "date_posted": date_posted}
-    url = f"{SC_BASE}/search/posts?{urlencode(params)}"
-
     try:
-        response = http.request(
-            "GET",
-            url,
-            headers={"x-api-key": token},
+        response = http.get(
+            f"{SC_BASE}/search/posts",
+            params={"query": topic, "date_posted": date_posted},
+            headers=http.scrapecreators_headers(token),
             timeout=30,
+            retries=2,
         )
     except http.HTTPError as exc:
         _log(f"Search failed (HTTP {exc.status_code}): {exc}")
@@ -271,10 +268,13 @@ def search_profile(profile_url: str, token: str) -> Dict[str, Any]:
     """Fetch a LinkedIn profile (incl. `articles[]`) via ScrapeCreators."""
     if not token or not profile_url:
         return {}
-    url = f"{SC_BASE}/profile?{urlencode({'url': profile_url})}"
     try:
-        response = http.request(
-            "GET", url, headers={"x-api-key": token}, timeout=30
+        response = http.get(
+            f"{SC_BASE}/profile",
+            params={"url": profile_url},
+            headers=http.scrapecreators_headers(token),
+            timeout=30,
+            retries=2,
         )
     except http.HTTPError as exc:
         _log(f"Profile fetch failed (HTTP {exc.status_code}): {exc}")
